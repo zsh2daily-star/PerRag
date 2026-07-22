@@ -1,0 +1,12 @@
+# 数据（向量库、数据库、用户数据）
+data/
+
+# 模型文件
+models/
+
+# 含 API key 的真实配置
+.env
+
+# Python
+__pycache__/
+*.pyc
