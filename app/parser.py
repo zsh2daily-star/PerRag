@@ -21,7 +21,7 @@ from app.mineru_client import MinerUError, parse_pdf_with_mineru
 logger = logging.getLogger(__name__)
 
 # 支持的所有文件扩展名
-SUPPORTED_EXTENSIONS = {".pdf", ".md", ".markdown", ".txt", ".docx", ".xlsx", ".xls", ".pptx", ".ppt"}
+SUPPORTED_EXTENSIONS = {".pdf", ".md", ".markdown", ".txt", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt"}
 
 # 文本文件编码探测顺序（中文文件常见编码，按使用频率排列）
 _ENCODING_CANDIDATES = (
@@ -199,6 +199,45 @@ def parse_pdf(path: Path) -> ParsedDocument:
     return parse_pdf_with_pypdf(path)
 
 
+# ── Word (.doc) 解析（旧格式）───────────────────────────────
+
+
+def parse_doc(path: Path) -> ParsedDocument:
+    """解析旧版 Word (.doc) 文档，使用 antiword 提取文本。
+
+    antiword 是 Linux 下最常用的 .doc 转文本工具，无需 GUI。
+    解析结果与 .docx 一致封装为 ParsedDocument。
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["antiword", "-m", "UTF-8.txt", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"antiword 解析超时: {path.name}")
+    except FileNotFoundError:
+        raise RuntimeError("antiword 未安装，请在 Dockerfile 中添加 antiword 依赖")
+    except Exception as e:
+        raise ValueError(f"antiword 执行失败: {e}")
+
+    if result.returncode != 0:
+        raise ValueError(
+            f"antiword 解析失败 ({result.returncode}): {result.stderr.strip() or path.name}"
+        )
+
+    text = result.stdout.strip()
+    if not text:
+        raise ValueError(f"antiword 未提取到文本: {path.name}")
+
+    return ParsedDocument(
+        text=text,
+        metadata={},
+        source_format="doc",
+    )
+
+
 # ── Word (.docx) 解析 ─────────────────────────────────────
 
 
@@ -208,7 +247,7 @@ def parse_docx(path: Path) -> ParsedDocument:
     .docx 本质是一个 ZIP 压缩包，内含 XML 文件。
     python-docx 库负责解析这些 XML，提取出文字内容。
 
-    注意: 不支持 .doc（旧格式），只支持 .docx。
+    注意: .doc（旧格式）请使用 parse_doc()，本函数仅处理 .docx。
     """
     try:
         from docx import Document as DocxDocument
@@ -446,6 +485,8 @@ def parse_file(path: Path) -> ParsedDocument:
 
     if suffix == ".pdf":
         return parse_pdf(path)
+    if suffix == ".doc":
+        return parse_doc(path)
     if suffix == ".docx":
         return parse_docx(path)
     if suffix in {".xlsx", ".xls"}:

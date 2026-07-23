@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     libgl1 \
     libglib2.0-0 \
+    antiword \
     && rm -rf /var/lib/apt/lists/*
 
 # 使用国内 PyPI 镜像加速（避免连接 pypi.org 超时）

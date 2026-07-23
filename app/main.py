@@ -576,8 +576,8 @@ def delete_conversation_endpoint(session_id: str):
 
 
 class DeleteDocumentRequest(BaseModel):
-    """删除文档请求 —— 按 source 路径匹配。"""
-    source: str = Field(description="文件路径，对应索引时记录在 payload.source 中的值")
+    """删除文档请求 —— 按文件名匹配（不关心路径变更）。"""
+    filename: str = Field(description="文件名，如 'report.pdf'，匹配 payload.filename 字段")
     collection: str | None = Field(
         default=None,
         description="目标 collection，默认使用 QDRANT_COLLECTION",
@@ -586,7 +586,7 @@ class DeleteDocumentRequest(BaseModel):
 
 @app.delete("/index/document")
 def delete_document(body: DeleteDocumentRequest):
-    """从知识库中删除指定文档。
+    """从知识库中按文件名删除指定文档。
 
     同时删除 dense 和 sparse 两个 collection 中该文件的所有向量点。
     不会删除磁盘上的原始文件 —— 只是解除索引。
@@ -594,19 +594,19 @@ def delete_document(body: DeleteDocumentRequest):
     示例:
         curl -X DELETE http://localhost:8000/index/document \
           -H "Content-Type: application/json" \
-          -d '{"source": "/app/data/uploads/old.pdf"}'
+          -d '{"filename": "old.pdf"}'
     """
     col = body.collection or settings.qdrant_collection
     indexer = get_indexer()
     # 临时覆写 collection（indexer 内部用 _collection_override）
     indexer._collection_override = col
-    indexer._delete_source(body.source)
-    indexer._delete_sparse_source(body.source)
+    indexer._delete_by_filename(body.filename)
+    indexer._delete_sparse_by_filename(body.filename)
     # 文档列表变了，刷新缓存
     threading.Thread(target=build_doc_list_cache, daemon=True).start()
     return {
         "message": "已删除",
-        "source": body.source,
+        "filename": body.filename,
         "collection": col,
     }
 

@@ -7,6 +7,9 @@ models/
 # 含 API key 的真实配置
 .env
 
+# Claude Code
+.claude/
+
 # Python
 __pycache__/
 *.pyc

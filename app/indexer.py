@@ -265,8 +265,8 @@ class DocumentIndexer:
 
     # ── 数据删除 ──────────────────────────────────────────
 
-    def _delete_source(self, source: str) -> None:
-        """删除指定文件在 Qdrant 中的稠密向量记录。"""
+    def _delete_by_filename(self, filename: str) -> None:
+        """按文件名删除指定文件在 Qdrant 中的稠密向量记录。"""
         client = self._get_client()
         name = self._collection
         existing = {c.name for c in client.get_collections().collections}
@@ -279,16 +279,16 @@ class DocumentIndexer:
                 filter=qmodels.Filter(
                     must=[
                         qmodels.FieldCondition(
-                            key="source",
-                            match=qmodels.MatchValue(value=source),
+                            key="filename",
+                            match=qmodels.MatchValue(value=filename),
                         )
                     ]
                 )
             ),
         )
 
-    def _delete_sparse_source(self, source: str) -> None:
-        """删除指定文件在 Qdrant 中的稀疏向量记录。"""
+    def _delete_sparse_by_filename(self, filename: str) -> None:
+        """按文件名删除指定文件在 Qdrant 中的稀疏向量记录。"""
         client = self._get_client()
         name = self._sparse_collection
         existing = {c.name for c in client.get_collections().collections}
@@ -301,16 +301,16 @@ class DocumentIndexer:
                 filter=qmodels.Filter(
                     must=[
                         qmodels.FieldCondition(
-                            key="source",
-                            match=qmodels.MatchValue(value=source),
+                            key="filename",
+                            match=qmodels.MatchValue(value=filename),
                         )
                     ]
                 )
             ),
         )
 
-    def _source_exists(self, source: str) -> bool:
-        """检查指定文件是否已导入过（在稠密向量集合中查询）。"""
+    def _filename_exists(self, filename: str) -> bool:
+        """检查指定文件名是否已导入过（按 filename 字段匹配，不关心路径）。"""
         client = self._get_client()
         name = self._collection
         existing = {c.name for c in client.get_collections().collections}
@@ -322,8 +322,8 @@ class DocumentIndexer:
             count_filter=qmodels.Filter(
                 must=[
                     qmodels.FieldCondition(
-                        key="source",
-                        match=qmodels.MatchValue(value=source),
+                        key="filename",
+                        match=qmodels.MatchValue(value=filename),
                     )
                 ]
             ),
@@ -413,19 +413,19 @@ class DocumentIndexer:
         path = path.resolve()
         source = str(path)
 
-        # skip 模式：检查是否已导入
+        # skip 模式：检查是否已导入（按文件名匹配，不关心路径）
         if skip_existing and not replace:
-            if self._source_exists(source):
+            if self._filename_exists(path.name):
                 logger.info("⊘ 已导入，跳过: %s", path.name)
                 return 0
 
         parsed = parse_file(path)
 
-        # replace 模式：先清除旧数据（稠密 + 稀疏两路）
+        # replace 模式：先清除旧数据（按文件名匹配，稠密 + 稀疏两路）
         if replace:
             self._get_index()
-            self._delete_source(source)
-            self._delete_sparse_source(source)
+            self._delete_by_filename(path.name)
+            self._delete_sparse_by_filename(path.name)
 
         # 构建元数据
         doc_metadata = {

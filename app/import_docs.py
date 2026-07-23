@@ -94,23 +94,52 @@ def main() -> int:
         collection=args.collection,
     )
 
-    # ── 3. 打印汇总统计 ──────────────────────────────────
+    # ── 3. 统计分类 ──────────────────────────────────────
+    duplicates = [f for f in result.files
+                  if f.status == "skipped" and f.error and "已导入" in f.error]
+    other_skips = [f for f in result.files
+                   if f.status == "skipped" and not (f.error and "已导入" in (f.error or ""))]
+    successes   = [f for f in result.files if f.status == "success"]
+    failures    = [f for f in result.files if f.status == "failed"]
+
+    # ── 4. 打印汇总 ──────────────────────────────────────
     print(f"\n{'=' * 50}")
     print(f"目录: {result.directory}")
     print(f"文件总数: {result.total_files}")
-    print(f"✓ 成功: {result.indexed}  |  ⊘ 跳过: {result.skipped}  |  ✗ 失败: {result.failed}")
+    print(f"✓ 新导入: {result.indexed}")
+    print(f"⊘ 重复跳过: {len(duplicates)}")
+    print(f"⊘ 其他跳过: {len(other_skips)}")
+    print(f"✗ 失败: {result.failed}")
     print(f"写入 chunk 总数: {result.total_chunks}")
     print(f"{'=' * 50}")
 
-    # ── 4. 打印失败/跳过详情 ──────────────────────────────
-    if result.failed > 0 or result.skipped > 0:
-        print("\n详情:")
-        for item in result.files:
-            if item.status != "success":
-                emoji = "✗" if item.status == "failed" else "⊘"
-                print(f"  {emoji} [{item.status}] {item.path}")
-                if item.error:
-                    print(f"      原因: {item.error}")
+    # ── 5. 新导入文件列表 ────────────────────────────────
+    if successes:
+        print(f"\n✅ 成功导入 ({len(successes)} 个):")
+        for item in successes:
+            print(f"    {item.path}  ({item.chunks} chunks)")
+
+    # ── 6. 重复跳过列表（压缩显示）───────────────────────
+    if duplicates:
+        print(f"\n🔁 重复跳过 ({len(duplicates)} 个):")
+        for item in duplicates:
+            print(f"    {item.path}")
+
+    # ── 7. 失败文件列表 ──────────────────────────────────
+    if failures:
+        print(f"\n❌ 导入失败 ({len(failures)} 个):")
+        for item in failures:
+            print(f"    {item.path}")
+            if item.error:
+                print(f"    ↳ 原因: {item.error}")
+
+    # ── 8. 其他跳过详情 ──────────────────────────────────
+    if other_skips:
+        print(f"\n⚠️  其他跳过 ({len(other_skips)} 个):")
+        for item in other_skips:
+            print(f"    {item.path}")
+            if item.error:
+                print(f"    ↳ 原因: {item.error}")
 
     # 退出码：有失败返回 1，全成功返回 0（方便 CI/脚本判断）
     return 1 if result.failed else 0

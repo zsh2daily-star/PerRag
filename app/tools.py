@@ -23,7 +23,18 @@ HYBRID_RAG_APPENDIX = """\n\n---\n附加能力：你可以使用以下知识库�
 - aggregate_documents: 跨文档全局汇总分析
 - list_documents: 列出知识库中的文件列表
 
-当用户问题涉及本地文件、文档、知识库内容时，优先调用这些工具获取信息。"""
+【重要规则】这些知识库工具 ONLY 在以下情况使用：
+- 用户明确询问文档内容、知识库信息、文件相关问题
+- 用户说"搜索""查找""知识库里有没有""帮我查文档"等
+- 用户的问题需要从本地文件中获取事实/数据来回答
+
+【禁止场景】以下情况绝对不要调用知识库工具：
+- 普通聊天、打招呼、闲聊
+- 执行外部工具操作（如发送消息到微信、发送邮件、操作设备等）
+- 用户的指令是让别的工具干活，不是在问文档问题
+- 任何与本地文件/知识库无关的请求
+
+如果不确定是否需要检索，默认不检索，直接回答或执行用户指定的外部工具。"""
 
 
 # ── 工具实现 ─────────────────────────────────────────────────
@@ -230,21 +241,21 @@ def _tool_status(args: dict) -> str:
 
 
 def _tool_delete(args: dict) -> str:
-    """删除文档索引。"""
+    """删除文档索引（按文件名匹配）。"""
     from app.indexer import DocumentIndexer
 
-    source = args.get("source", "")
-    if not source:
-        return "错误: source 不能为空"
+    filename = args.get("filename", "")
+    if not filename:
+        return "错误: filename 不能为空"
 
     indexer = DocumentIndexer()
     indexer._collection_override = settings.qdrant_collection
-    indexer._delete_source(source)
-    indexer._delete_sparse_source(source)
+    indexer._delete_by_filename(filename)
+    indexer._delete_sparse_by_filename(filename)
     from app.main import build_doc_list_cache
     import threading
     threading.Thread(target=build_doc_list_cache, daemon=True).start()
-    return f"✓ 已从知识库删除: {source}"
+    return f"✓ 已从知识库删除: {filename}"
 
 
 def _tool_aggregate(args: dict) -> str:
@@ -462,13 +473,13 @@ _registry: dict[str, dict[str, Any]] = {
             "type": "function",
             "function": {
                 "name": "delete_document",
-                "description": "从知识库中删除一个文档的索引。不会删除磁盘上的原始文件。",
+                "description": "从知识库中按文件名删除一个文档的索引。不会删除磁盘上的原始文件。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "source": {"type": "string", "description": "文档在 Qdrant 中的 source 路径（完整路径）。可先调 list_documents 获取。"},
+                        "filename": {"type": "string", "description": "文档文件名（精确匹配），如 'report.pdf'。可先调 list_documents 获取文件名列表。"},
                     },
-                    "required": ["source"],
+                    "required": ["filename"],
                 },
             },
         },
