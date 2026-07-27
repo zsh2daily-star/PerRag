@@ -206,36 +206,74 @@ def parse_doc(path: Path) -> ParsedDocument:
     """解析旧版 Word (.doc) 文档，使用 antiword 提取文本。
 
     antiword 是 Linux 下最常用的 .doc 转文本工具，无需 GUI。
-    解析结果与 .docx 一致封装为 ParsedDocument。
+    对 WPS 等非标准生成的 .doc，增加降级策略。
     """
     import subprocess
 
+    # 策略 1：antiword（标准 .doc）
+    text = _try_antiword(path)
+    if text:
+        return ParsedDocument(text=text, metadata={}, source_format="doc")
+
+    # 策略 2：python-docx（.doc 实际是 .docx 但扩展名错了）
+    text = _try_docx(path)
+    if text:
+        return ParsedDocument(text=text, metadata={}, source_format="doc")
+
+    # 策略 3：olefile 读取 OLE2 WordDocument 流（WPS 等非标准 .doc）
+    text = _try_olefile(path)
+    if text:
+        return ParsedDocument(text=text, metadata={}, source_format="doc")
+
+    raise ValueError(f"无法解析 .doc 文件（antiword/docx/olefile 均失败）: {path.name}")
+
+
+def _try_antiword(path: Path) -> str:
+    import subprocess
     try:
         result = subprocess.run(
             ["antiword", "-m", "UTF-8.txt", str(path)],
             capture_output=True, text=True, timeout=30,
         )
-    except subprocess.TimeoutExpired:
-        raise ValueError(f"antiword 解析超时: {path.name}")
-    except FileNotFoundError:
-        raise RuntimeError("antiword 未安装，请在 Dockerfile 中添加 antiword 依赖")
-    except Exception as e:
-        raise ValueError(f"antiword 执行失败: {e}")
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
 
-    if result.returncode != 0:
-        raise ValueError(
-            f"antiword 解析失败 ({result.returncode}): {result.stderr.strip() or path.name}"
-        )
 
-    text = result.stdout.strip()
-    if not text:
-        raise ValueError(f"antiword 未提取到文本: {path.name}")
+def _try_docx(path: Path) -> str:
+    """尝试用 python-docx 解析（有些 .doc 实际是 .docx）。"""
+    try:
+        from docx import Document as DocxDocument
+        doc = DocxDocument(str(path))
+        parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                parts.append(" | ".join(cells))
+        return "\n".join(parts) if parts else ""
+    except Exception:
+        return ""
 
-    return ParsedDocument(
-        text=text,
-        metadata={},
-        source_format="doc",
-    )
+
+def _try_olefile(path: Path) -> str:
+    """尝试用 olefile 读取 OLE2 WordDocument 流（WPS 等非标准 .doc）。"""
+    try:
+        from olefile import OleFileIO
+        ole = OleFileIO(str(path))
+        if ole.exists("WordDocument"):
+            data = ole.openstream("WordDocument").read()
+            # Word FIB (File Information Block) 中 text 起始偏移在 0x18 处
+            # 这里简单取可打印字符段
+            import re
+            text = data.decode("utf-16-le", errors="ignore")
+            # 过滤出中英文可读内容
+            segments = re.findall(r"[一-鿿　-〿＀-￯a-zA-Z0-9\s　-〿＀-￯\-.,()\[\]{}:;!?@#$%^&*+=/\\|<>`~]{4,}", text)
+            result = "\n".join(segments)
+            return result if len(result) > 100 else ""
+    except Exception:
+        return ""
 
 
 # ── Word (.docx) 解析 ─────────────────────────────────────
