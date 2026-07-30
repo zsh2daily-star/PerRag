@@ -16,6 +16,7 @@
 
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -992,6 +993,65 @@ def _expand_query(query: str) -> list[str]:
             f"{core} 统计",
         ]
     return expanded[:3]
+def _parse_xml_tool_calls(content: str) -> tuple[str | None, list[dict] | None]:
+    """从 LLM 文本输出中提取 XML 格式的 tool_calls，返回 (clean_content, tool_calls)。
+
+    某些 LLM（如 deepseek）偶尔把 tool call 写成文本 XML 而非标准 tool_calls 字段。
+    兜底解析 <tool_calls> / <invoke> 格式，并返回去除 XML 后的干净内容。
+    未匹配时返回 (content, None)。
+
+    支持格式:
+        <tool_calls>
+        <invoke name="search_knowledge_base">
+        <parameter name="query">巴普</parameter>
+        </invoke>
+        </tool_calls>
+    """
+    if not content:
+        return (content, None)
+
+    pattern = r'<tool_calls>\s*(.*?)\s*</tool_calls>'
+    match = re.search(pattern, content, re.DOTALL)
+    if not match:
+        return (content, None)
+
+    xml_block = match.group(0)
+    inner = match.group(1)
+
+    # 解析每个 <invoke> 块
+    invoke_pattern = r'<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>'
+    parsed: list[dict] = []
+    for im in re.finditer(invoke_pattern, inner, re.DOTALL):
+        func_name = im.group(1)
+        params_block = im.group(2)
+        args: dict = {}
+        for pm in re.finditer(r'<parameter\s+name="([^"]+)">(.*?)</parameter>', params_block, re.DOTALL):
+            args[pm.group(1)] = pm.group(2).strip()
+
+        call_id = f"call_xml_{uuid.uuid4().hex[:8]}"
+        parsed.append({
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": func_name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        })
+
+    if not parsed:
+        return (content, None)
+
+    # 去除 XML 块，返回干净内容
+    clean = content[:match.start()] + content[match.end():]
+    clean = clean.strip()
+
+    logger = logging.getLogger(__name__)
+    logger.info("XML tool_calls 解析: %s → %d 个工具调用",
+                 [tc["function"]["name"] for tc in parsed], len(parsed))
+
+    return (clean or None, parsed)
+
+
 def _run_hybrid_agent(
     messages: list[dict],
     tools: list[dict],
@@ -1038,6 +1098,13 @@ def _run_hybrid_agent(
 
         tool_calls = result.get("tool_calls")
         content = result.get("content")
+
+        # ── XML 兜底：标准 tool_calls 为空时尝试从文本中解析 ──
+        if not tool_calls and content:
+            content, tool_calls = _parse_xml_tool_calls(content)
+        # 有 tool_calls 时清理 content 中残留的 XML 文本
+        if tool_calls and content and '<tool_calls>' in content:
+            content = re.sub(r'<tool_calls>.*?</tool_calls>\s*', '', content, flags=re.DOTALL).strip() or None
 
         if tool_calls:
             # 记录 assistant 的 tool_calls 消息
@@ -1151,6 +1218,13 @@ def _stream_hybrid_agent(
 
         tool_calls = result.get("tool_calls")
         content = result.get("content")
+
+        # ── XML 兜底：标准 tool_calls 为空时尝试从文本中解析 ──
+        if not tool_calls and content:
+            content, tool_calls = _parse_xml_tool_calls(content)
+        # 有 tool_calls 时清理 content 中残留的 XML 文本
+        if tool_calls and content and '<tool_calls>' in content:
+            content = re.sub(r'<tool_calls>.*?</tool_calls>\s*', '', content, flags=re.DOTALL).strip() or None
 
         if tool_calls:
             # 显示工具名

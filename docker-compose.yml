@@ -38,6 +38,11 @@ services:
       - MINERU_BACKEND=pipeline
       - MINERU_LANG=ch
       - MINERU_TIMEOUT=${MINERU_TIMEOUT:-600}
+      - MINERU_VRAM_THRESHOLD=${MINERU_VRAM_THRESHOLD:-0.65}
+      - MINERU_RESTART_EVERY_N=${MINERU_RESTART_EVERY_N:-10}
+      - MINERU_PAGE_CHUNK_SIZE=${MINERU_PAGE_CHUNK_SIZE:-20}
+      - MINERU_MIN_CHUNK_SIZE=${MINERU_MIN_CHUNK_SIZE:-5}
+      - MINERU_CHUNK_RESTART_EVERY=${MINERU_CHUNK_RESTART_EVERY:-5}
       # Ollama 大模型 —— 宿主机，通过 host.docker.internal 访问
       - OLLAMA_HOST=host.docker.internal
       - OLLAMA_PORT=11434
@@ -72,6 +77,7 @@ services:
       - ./models:/app/models
       - ./app:/app/app
       - /mnt/公司文件/公司内部文件:/app/data/ragtemp:ro
+      - /mnt/个人文件:/app/data/personal:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
       - rag-network

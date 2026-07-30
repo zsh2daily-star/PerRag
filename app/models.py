@@ -10,6 +10,7 @@ indexer.py 和 retriever.py 各自需要加载 BGE-M3 和 Reranker 模型，
 import logging
 import threading
 from pathlib import Path
+from typing import Any
 
 import torch
 from llama_index.core import Settings
@@ -25,6 +26,7 @@ _sparse_model = None
 _reranker = None
 _embed_model: HuggingFaceEmbedding | None = None
 _lock = threading.Lock()
+_offloaded: set[str] = set()  # 已卸载到 CPU 的模型名
 
 # ── 设备检测 ──────────────────────────────────────────────
 
@@ -45,7 +47,7 @@ def get_sparse_model() -> "BGEM3FlagModel":
 
     共享同一个模型权重文件，indexer.py 和 retriever.py 都会用到。
     """
-    global _sparse_model
+    global _sparse_model, _offloaded
     if _sparse_model is None:
         with _lock:
             if _sparse_model is None:
@@ -60,6 +62,10 @@ def get_sparse_model() -> "BGEM3FlagModel":
                     cache_dir=cache_dir,
                     devices=[DEVICE],
                 )
+    if "sparse" in _offloaded:
+        _move_model_to_device(_sparse_model, DEVICE)
+        _offloaded.discard("sparse")
+        logger.info("稀疏编码器已恢复到 %s", DEVICE)
     return _sparse_model
 
 
@@ -69,7 +75,7 @@ def get_reranker() -> "FlagReranker":
     与 BGE-M3 不同，这是专门做"相关性打分"的模型：
     输入 (query, doc) 对，输出 0~1 的相关性分数。
     """
-    global _reranker
+    global _reranker, _offloaded
     if _reranker is None:
         with _lock:
             if _reranker is None:
@@ -84,6 +90,10 @@ def get_reranker() -> "FlagReranker":
                     cache_dir=cache_dir,
                     use_fp16=DEVICE == "cuda",
                 )
+    if "reranker" in _offloaded:
+        _move_model_to_device(_reranker, DEVICE)
+        _offloaded.discard("reranker")
+        logger.info("重排模型已恢复到 %s", DEVICE)
     return _reranker
 
 
@@ -92,8 +102,10 @@ def get_embed_model() -> HuggingFaceEmbedding:
 
     首次加载需要从 HuggingFace 下载模型文件（约 2GB），
     之后缓存到 HF_HOME 目录，重启不必重新下载。
+
+    如果之前被 offload_models_to_cpu() 卸载，自动恢复到 GPU。
     """
-    global _embed_model
+    global _embed_model, _offloaded
     if _embed_model is None:
         with _lock:
             if _embed_model is None:
@@ -107,7 +119,74 @@ def get_embed_model() -> HuggingFaceEmbedding:
                     device=DEVICE,
                 )
                 Settings.embed_model = _embed_model
+    elif "embed" in _offloaded:
+        _move_model_to_device(_embed_model, DEVICE)
+        _offloaded.discard("embed")
+        logger.info("嵌入模型已恢复到 %s", DEVICE)
     return _embed_model
+
+
+def _move_model_to_device(outer: Any, device: str) -> bool:
+    """尝试将模型对象移动到指定设备（通用探测）。"""
+    # 直接支持 .to() 的对象
+    if hasattr(outer, "to") and callable(outer.to):
+        try:
+            outer.to(device)
+            return True
+        except Exception:
+            pass
+
+    # 探测常见属性：_model（llama_index）、model（FlagEmbedding）
+    for attr in ("_model", "model"):
+        inner = getattr(outer, attr, None)
+        if inner is not None and hasattr(inner, "to") and callable(inner.to):
+            try:
+                inner.to(device)
+                return True
+            except Exception:
+                pass
+
+    return False
+
+
+def offload_models_to_cpu() -> None:
+    """将嵌入/稀疏/重排模型从 GPU 卸载到 CPU，释放显存给 MinerU。
+
+    幂等：已在 CPU 的模型跳过。每个模型独立追踪，
+    get_embed_model() 等被调用时自动恢复到 GPU。
+    """
+    global _offloaded
+
+    freed = False
+    for name, ref in [("embed", _embed_model), ("sparse", _sparse_model), ("reranker", _reranker)]:
+        if name in _offloaded:
+            continue
+        if ref is not None and _move_model_to_device(ref, "cpu"):
+            _offloaded.add(name)
+            logger.debug("  %s → CPU", name)
+            freed = True
+
+    if freed:
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("模型已卸载到 CPU，GPU 显存已释放")
+
+
+def reload_models_to_gpu() -> None:
+    """将所有已卸载的模型从 CPU 移回 GPU。"""
+    global _offloaded
+    if not _offloaded:
+        return
+
+    for name in list(_offloaded):
+        ref = {"embed": _embed_model, "sparse": _sparse_model, "reranker": _reranker}[name]
+        if ref is not None and _move_model_to_device(ref, DEVICE):
+            _offloaded.discard(name)
+            logger.debug("  %s → %s", name, DEVICE)
+
+    torch.cuda.empty_cache()
+    logger.info("模型已恢复到 %s", DEVICE.upper())
 
 
 def warmup_models(blocking: bool = False) -> None:

@@ -7,11 +7,11 @@
       → Sparse 向量（BGE-M3 词权重 → Qdrant {collection}_sparse）
 
 用法:
-    # 追加导入（默认，不删除已有数据）
+    # 默认跳过已导入文件（增量导入，避免重复工作）
     python -m app.import_docs --dir /path/to/docs
 
-    # 跳过已导入的文件（增量导入，避免重复工作）
-    python -m app.import_docs --dir /path/to/docs --skip-existing
+    # 不跳过已导入文件，强制重新处理（适合模型或分块参数更新后重建）
+    python -m app.import_docs --dir /path/to/docs --no-skip-existing
 
     # 强制重建（删除旧索引后重新导入，适合数据更新场景）
     python -m app.import_docs --dir /path/to/docs --replace
@@ -73,9 +73,10 @@ def main() -> int:
         help="目标 Qdrant collection（默认: 使用 QDRANT_COLLECTION 环境变量）",
     )
     parser.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="跳过已导入的文件，只处理新文件（增量导入）",
+        "--no-skip-existing",
+        dest="skip_existing",
+        action="store_false",
+        help="不跳过已导入文件，强制重新处理（默认跳过）",
     )
     parser.add_argument(
         "--replace",
