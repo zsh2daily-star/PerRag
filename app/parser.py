@@ -20,6 +20,7 @@ from app.mineru_client import MinerUError, parse_pdf_with_mineru
 
 logger = logging.getLogger(__name__)
 
+
 # 支持的所有文件扩展名
 SUPPORTED_EXTENSIONS = {".pdf", ".md", ".markdown", ".txt", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt"}
 
@@ -130,6 +131,156 @@ def _warn_extension_mismatch(path: Path, expected_category: str) -> None:
         )
 
 
+# ── 解析质量检测 ──────────────────────────────────────────
+
+
+def _sample_positions(text: str, sample_size: int = 1000, positions: int = 5) -> list[str]:
+    """从文本的前、中、后等多段均匀取样，避免单点误判。
+
+    为什么需要多段采样？古籍 PDF 可能前半本是文字（解析正常）、后半本是表格
+    或图片（解析为空），或者反过来。多段采样能覆盖整篇文档。
+    """
+    total = len(text)
+    if total <= sample_size * positions:
+        return [text]
+
+    samples = []
+    for i in range(positions):
+        start = int(total * i / positions)
+        end = min(start + sample_size, total)
+        samples.append(text[start:end])
+    return samples
+
+
+def check_parse_quality(text: str, sample_size: int = 1000) -> dict:
+    """检测 MinerU 解析输出的文本质量。返回质量评分和诊断信息。
+
+    核心思路：OCR 乱码 = 零星的非中文字符散布在中文字符之间，
+    而不是正常的成片数字/英文。关键区分：
+
+      OCR 乱码：   "取其經 il. 1 + tnt TL 4 11 .. 2 沁中"
+                   ↑ 数字和拉丁字母是 1-2 个孤立散布的
+
+      正常文档：   "产能 63.5GWh，eVTOL 低空经济 3000P"
+                   ↑ 数字和英文是成片出现的，代表数据/缩写
+
+    检测三个维度：
+    - 孤立数字密度：两边被 CJK/空格包围的 1-2 位数字碎片
+    - 孤立拉丁密度：两边被 CJK/空格包围的 1-2 个字母碎片
+    - 行内空格密度：CJK 字符之间的无意义空格
+
+    返回:
+        {"score": 0.0~1.0, "is_garbled": bool, "details": str}
+        score ≥ 0.5 认为正常，< 0.5 认为乱码。
+    """
+
+    if not text or len(text) < 100:
+        return {"score": 0.0, "is_garbled": True, "details": "文本过短或为空"}
+
+    def _is_cjk(ch: str) -> bool:
+        return '一' <= ch <= '鿿' or '㐀' <= ch <= '䶿'
+
+    samples = _sample_positions(text, sample_size)
+    all_scores: list[float] = []
+
+    for sample in samples:
+        total = len(sample)
+
+        cjk = 0
+        isolated_digits = 0   # OCR 特征：零星散布的数字
+        isolated_latin = 0    # OCR 特征：零星散布的拉丁字母
+        inline_spaces = 0     # CJK 文本中的行内空格
+
+        i = 0
+        while i < total:
+            ch = sample[i]
+            if _is_cjk(ch):
+                cjk += 1
+                i += 1
+                continue
+
+            if ch.isdigit() or (ch.isascii() and ch.isalpha()):
+                # 收集连续的同类字符序列
+                seq_end = i
+                is_digit_run = ch.isdigit()
+                while seq_end < total and (
+                    sample[seq_end].isdigit() if is_digit_run
+                    else (sample[seq_end].isascii() and sample[seq_end].isalpha())
+                ):
+                    seq_end += 1
+
+                seq_len = seq_end - i
+
+                if is_digit_run and seq_len <= 2:
+                    # 1-2 位短数字序列 → 检查是否孤立（两边是 CJK 或非法定界符）
+                    left = sample[i-1] if i > 0 else ' '
+                    right = sample[seq_end] if seq_end < total else ' '
+                    if (_is_cjk(left) or left.isspace() or not left.isalnum()) and \
+                       (_is_cjk(right) or right.isspace() or not right.isalnum()):
+                        isolated_digits += seq_len
+                elif not is_digit_run and seq_len <= 2:
+                    # 1-2 字母短序列 → 检查是否孤立
+                    left = sample[i-1] if i > 0 else ' '
+                    right = sample[seq_end] if seq_end < total else ' '
+                    if (_is_cjk(left) or left.isspace()) and \
+                       (_is_cjk(right) or right.isspace()):
+                        isolated_latin += seq_len
+
+                i = seq_end
+                continue
+
+            if ch == ' ':
+                # 只算 CJK 文本中的行内空格
+                left_cjk = i > 0 and _is_cjk(sample[i-1])
+                right_cjk = i + 1 < total and _is_cjk(sample[i+1])
+                if left_cjk or right_cjk:
+                    inline_spaces += 1
+
+            i += 1
+
+        # 计算比率
+        iso_digit_ratio = isolated_digits / total
+        iso_latin_ratio = isolated_latin / total
+        space_ratio = inline_spaces / total
+        cjk_ratio = cjk / total
+
+        # 噪声评分：三个维度独立计分
+        # 孤立数字 >3%   → 强乱码信号
+        # 孤立拉丁 >2%   → 极强乱码信号（正常中文文档几乎不会出现）
+        # 行内空格 >6%   → 中等乱码信号
+        noise = (
+            min(iso_digit_ratio / 0.03, 1.0) * 20  # 孤立数字超 3% 满分
+            + min(iso_latin_ratio / 0.02, 1.0) * 30  # 孤立拉丁超 2% 满分
+            + min(space_ratio / 0.06, 1.0) * 10     # 行内空格超 6% 满分
+        )
+        # 总分 0-60，>25 判乱码
+
+        score = max(0.0, min(1.0, 1.0 - noise / 60.0))
+        all_scores.append(score)
+
+    # 取 P40（5 样本中倒数第二差）而非 min()：
+    # - 正常文档偶尔有统计表/索引页导致单个样本分低
+    # - 乱码文档整篇都差，5 个样本里至少 4 个低分
+    # P40 能容忍单个异常段，不被统计表/英文摘要误触发
+    sorted_scores = sorted(all_scores)
+    p40_idx = max(0, int(len(sorted_scores) * 0.4))
+    final_score = sorted_scores[p40_idx]
+
+    # 额外保护：如果只有1个样本不及格（<0.5）但大多数及格，不判乱码
+    bad_count = sum(1 for s in all_scores if s < 0.5)
+    total_samples = len(all_scores)
+
+    return {
+        "score": round(final_score, 3),
+        "is_garbled": final_score < 0.5 and bad_count >= total_samples * 0.4,
+        "details": (
+            f"cjk={cjk_ratio*100:.0f}% iso_digit={iso_digit_ratio*100:.1f}% "
+            f"iso_latin={iso_latin_ratio*100:.1f}% sp={space_ratio*100:.0f}% "
+            f"({bad_count}/{total_samples} bad)"
+        ),
+    }
+
+
 # ── PDF 解析 ──────────────────────────────────────────────
 
 
@@ -173,6 +324,9 @@ def parse_pdf(path: Path) -> ParsedDocument:
     - mineru : 只用 MinerU（GPU OCR，适合扫描件）
     - pypdf  : 只用 pypdf（快，但只能处理文字型 PDF）
     - auto   : 先 MinerU，失败后自动降级 pypdf
+
+    MinerU 解析后会跑质量检测，不达标的在 metadata 里标记 quality_warning，
+    不阻断索引流程——搜索时 LLM 能看到这个标记并告知用户结果可能不可靠。
     """
     _warn_extension_mismatch(path, "pdf")
     mode = settings.pdf_parser.lower()
@@ -183,17 +337,30 @@ def parse_pdf(path: Path) -> ParsedDocument:
     if mode in {"mineru", "auto"}:
         try:
             text = parse_pdf_with_mineru(path)
+
+            quality = check_parse_quality(text)
+            logger.info(
+                "MinerU 解析完成 %s: score=%.3f garbled=%s %s",
+                path.name, quality["score"], quality["is_garbled"], quality["details"],
+            )
+
+            metadata: dict = {}
+            if quality["is_garbled"]:
+                metadata["quality_warning"] = (
+                    f"本文档 OCR 解析质量低 (score={quality['score']:.2f})，"
+                    f"可能存在大量乱码或缺失文字，内容仅供参考。"
+                )
+                logger.warning("⚠ OCR 疑似乱码: %s (score=%.2f)", path.name, quality["score"])
+
             return ParsedDocument(
                 text=text,
-                metadata={},
-                page_count=None,  # MinerU 不返回页数
+                metadata=metadata,
+                page_count=None,
                 source_format="pdf",
             )
         except (MinerUError, httpx.HTTPError) as exc:
             if mode == "mineru":
-                # mineru 模式严格要求成功，失败则抛出
                 raise ValueError(f"MinerU 解析失败: {exc}") from exc
-            # auto 模式则降级到 pypdf
             logger.warning("MinerU 失败，降级 pypdf: %s -> %s", path.name, exc)
 
     return parse_pdf_with_pypdf(path)

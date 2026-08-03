@@ -9,7 +9,7 @@
     messages, tools = rag_skill.apply(messages, tools)
 """
 
-from app.tools import CORE_TOOLS, HYBRID_RAG_APPENDIX
+from app.tools import CORE_TOOLS, HYBRID_RAG_APPENDIX, _get_collections_hint
 
 
 class RAGSkill:
@@ -22,7 +22,9 @@ class RAGSkill:
     ) -> tuple[list[dict], list[dict]]:
         """对请求做 RAG 预处理，返回 (messages, tools) 供 Agent 使用。
 
-        不会修改原参数。
+        RAG Skill 不改变用户的原始意图（不会把"打电话"篡改成"搜索"），
+        它只在原始 system prompt 后面追加知识库工具的使用说明。
+        用户发来的 system prompt 仍然能精确控制 LLM 的行为。
         """
         messages = RAGSkill._augment_system_prompt(messages)
         tools = RAGSkill._ensure_rag_tools(tools)
@@ -30,14 +32,19 @@ class RAGSkill:
 
     @staticmethod
     def _augment_system_prompt(messages: list[dict]) -> list[dict]:
-        """保留原始 system prompt，追加 RAG 工具描述。"""
+        """保留原始 system prompt，追加 RAG 工具描述 + 可用 collection 列表。"""
+        collections_hint = _get_collections_hint()
+        appendix = HYBRID_RAG_APPENDIX.replace(
+            "{collections_note}", collections_hint
+        )
+
         original = next(
             (m for m in messages if m.get("role") == "system"), None
         )
         if original and original.get("content"):
-            augmented = original["content"] + HYBRID_RAG_APPENDIX
+            augmented = original["content"] + appendix
         else:
-            augmented = "你是智能助手。" + HYBRID_RAG_APPENDIX.lstrip("\n")
+            augmented = "你是智能助手。" + appendix.lstrip("\n")
 
         return [
             {"role": "system", "content": augmented}

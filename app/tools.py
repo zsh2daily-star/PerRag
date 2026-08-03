@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from qdrant_client import QdrantClient
 
@@ -22,6 +22,9 @@ HYBRID_RAG_APPENDIX = """\n\n---\n附加能力：你可以使用以下知识库�
 - search_knowledge_base: 精确检索文档内容
 - aggregate_documents: 跨文档全局汇总分析
 - list_documents: 列出知识库中的文件列表
+- list_collections: 列出所有可用的知识库集合
+
+{collections_note}
 
 【重要规则】这些知识库工具 ONLY 在以下情况使用：
 - 用户明确询问文档内容、知识库信息、文件相关问题
@@ -37,6 +40,21 @@ HYBRID_RAG_APPENDIX = """\n\n---\n附加能力：你可以使用以下知识库�
 如果不确定是否需要检索，默认不检索，直接回答或执行用户指定的外部工具。"""
 
 
+def _get_collections_hint() -> str:
+    """动态生成可用 collection 列表提示（从 Qdrant 实时获取）。"""
+    try:
+        client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
+        cols = client.get_collections().collections
+        dense_cols = sorted(
+            c.name for c in cols if not c.name.endswith("_sparse")
+        )
+        if not dense_cols:
+            return "（暂无可用知识库集合）"
+        return "当前可用的知识库集合:\n  - " + "\n  - ".join(dense_cols)
+    except Exception:
+        return ""
+
+
 # ── 工具实现 ─────────────────────────────────────────────────
 
 
@@ -48,9 +66,10 @@ def _tool_search(args: dict) -> str:
     if not query:
         return "错误: query 不能为空"
 
+    collection = args.get("collection") or settings.qdrant_collection
     filters = args.get("filters")
     documents = get_retriever().retrieve(
-        query, settings.qdrant_collection, top_k=10, filters=filters,
+        query, collection, top_k=10, filters=filters,
     )
     if not documents:
         return f"未找到与 '{query}' 相关的文档。"
@@ -64,18 +83,19 @@ def _tool_search(args: dict) -> str:
     return "\n\n".join(parts)
 
 
-def _tool_list_docs(_args: dict) -> str:
-    """列出所有已索引文档。"""
+def _tool_list_docs(args: dict) -> str:
+    """列出所有已索引文档（可按 collection 筛选）。"""
     from app.main import _list_docs_from_qdrant
 
-    docs = _list_docs_from_qdrant()
+    collection = args.get("collection") or settings.qdrant_collection
+    docs = _list_docs_from_qdrant(collection=collection)
     if not docs:
-        return "知识库中暂无文档。"
+        return f"知识库 {collection} 中暂无文档。"
     lines = [
         f"- {d['filename']} ({d['chunks']} chunks, source: {d['source']})"
         for d in docs[:30]
     ]
-    return f"知识库共 {len(docs)} 个文档:\n" + "\n".join(lines)
+    return f"知识库 {collection} 共 {len(docs)} 个文档:\n" + "\n".join(lines)
 
 
 def _tool_get_content(args: dict) -> str:
@@ -85,6 +105,7 @@ def _tool_get_content(args: dict) -> str:
 
     filename = args.get("filename", "")
     max_chunks = args.get("max_chunks", 20)
+    collection = args.get("collection") or settings.qdrant_collection
     if not filename:
         return "错误: filename 不能为空"
 
@@ -93,7 +114,7 @@ def _tool_get_content(args: dict) -> str:
         client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
         query_vector = embed_model.get_query_embedding(filename)
         results = client.query_points(
-            collection_name=settings.qdrant_collection,
+            collection_name=collection,
             query=query_vector,
             using="text-dense",
             limit=max_chunks,
@@ -248,8 +269,9 @@ def _tool_delete(args: dict) -> str:
     if not filename:
         return "错误: filename 不能为空"
 
+    collection = args.get("collection") or settings.qdrant_collection
     indexer = DocumentIndexer()
-    indexer._collection_override = settings.qdrant_collection
+    indexer._collection_override = collection
     indexer._delete_by_filename(filename)
     indexer._delete_sparse_by_filename(filename)
     from app.main import build_doc_list_cache
@@ -263,6 +285,7 @@ def _tool_aggregate(args: dict) -> str:
     from app.retriever import get_retriever
 
     query = args.get("query", "")
+    collection = args.get("collection") or settings.qdrant_collection
     filters = args.get("filters")
     retriever = get_retriever()
 
@@ -274,7 +297,7 @@ def _tool_aggregate(args: dict) -> str:
     for q in queries:
         try:
             docs = retriever.retrieve(
-                q, settings.qdrant_collection, top_k=10, filters=filters,
+                q, collection, top_k=10, filters=filters,
             )
         except Exception:
             continue
@@ -329,11 +352,12 @@ _registry: dict[str, dict[str, Any]] = {
             "type": "function",
             "function": {
                 "name": "search_knowledge_base",
-                "description": "在知识库中检索文档并回答问题。走 Dense+Sparse 双路召回 + RRF 融合 + Cross-Encoder 重排。适合：文档问答、内容查询、事实检索。",
+                "description": "在指定知识库集合中检索文档。支持 Dense+Sparse 双路召回 + RRF 融合 + Cross-Encoder 重排。适合：文档问答、内容查询、事实检索。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "检索查询，用自然语言或关键词。越具体越好。"},
+                        "collection": {"type": "string", "description": "目标知识库集合名称，如 'workfile' 或 '中医'。不传则使用默认集合。"},
                         "filters": {"type": "object", "description": "可选 metadata 过滤条件，如 {\"source_format\": \"pdf\"}。支持 * 通配符。"},
                     },
                     "required": ["query"],
@@ -348,11 +372,12 @@ _registry: dict[str, dict[str, Any]] = {
             "type": "function",
             "function": {
                 "name": "aggregate_documents",
-                "description": "跨文档全局分析——多轮检索 + 汇总去重 + LLM 整体统计分析。适合：'总结知识库趋势'、'跨文档统计'。",
+                "description": "跨文档全局分析——多轮检索 + 汇总去重。适合：'总结知识库趋势'、'跨文档统计'。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "分析主题或问题"},
+                        "collection": {"type": "string", "description": "目标知识库集合名称，如 'workfile' 或 '中医'。不传则使用默认集合。"},
                         "filters": {"type": "object", "description": "可选过滤条件"},
                     },
                     "required": ["query"],
@@ -367,8 +392,13 @@ _registry: dict[str, dict[str, Any]] = {
             "type": "function",
             "function": {
                 "name": "list_documents",
-                "description": "列出知识库中所有已索引的文档，显示文件名、路径和 chunk 数量。适合：用户问'有哪些文件'、'知识库有什么'时用。",
-                "parameters": {"type": "object", "properties": {}},
+                "description": "列出指定知识库集合中所有已索引的文档，显示文件名和 chunk 数量。适合：用户问'有哪些文件'、'知识库有什么'时用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "collection": {"type": "string", "description": "目标知识库集合名称，如 'workfile' 或 '中医'。不传则使用默认集合。"},
+                    },
+                },
             },
         },
         "handler": _tool_list_docs,
@@ -384,6 +414,7 @@ _registry: dict[str, dict[str, Any]] = {
                     "type": "object",
                     "properties": {
                         "filename": {"type": "string", "description": "文档文件名（精确匹配），如 'report.pdf'"},
+                        "collection": {"type": "string", "description": "目标知识库集合名称。不传则使用默认集合。"},
                         "max_chunks": {"type": "integer", "description": "最多返回多少 chunk，默认 20"},
                     },
                     "required": ["filename"],
@@ -478,6 +509,7 @@ _registry: dict[str, dict[str, Any]] = {
                     "type": "object",
                     "properties": {
                         "filename": {"type": "string", "description": "文档文件名（精确匹配），如 'report.pdf'。可先调 list_documents 获取文件名列表。"},
+                        "collection": {"type": "string", "description": "目标知识库集合名称。不传则使用默认集合。"},
                     },
                     "required": ["filename"],
                 },
