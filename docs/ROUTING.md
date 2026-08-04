@@ -36,7 +36,7 @@ POST /v1/chat/completions
     RAG 工具 rag-api 内部执行，外部工具透传给 Hermes
 ```
 
-> **本地模型**：默认使用 `qwen3-xlam`（Qwen3-8B-Function-Calling-xLAM-Unsloth），具备可靠的 tool-calling 能力。如切回原生 qwen3:8b（tool-calling 弱），需恢复旧版上下文注入分支。
+> **LLM 后端**：系统支持双后端：本地 Ollama（默认 `qwen3:8b`，用于轻量路由判断）和远程 DeepSeek API（默认 `deepseek-chat`，用于 function calling 和 RAG 问答）。远程模型支持 tool_calls，是 Agent 模式下推荐的后端。模型可通过请求 body 中的 `model` 字段指定，不在 Ollama 列表中的模型名自动走远程 API。
 
 ### 路由演进
 
@@ -45,7 +45,7 @@ POST /v1/chat/completions
 | v1 | 三条分支：Agent / Tool 透传(ollama注入 vs api Hybrid) / 纯RAG |
 | v2（上一步） | ollama 上下文注入 + api Hybrid Agent，通过 `route_query` 判断意图 |
 | v3 | 统一 Hybrid Agent，换 xLAM 模型后 ollama 也走 Agent 循环 |
-| v4（当前） | 注册表模式（tools.py）+ RAG Skill 预处理器（skills.py），一行 apply() 完成预处理 |
+| v4（当前） | 注册表模式（tools.py）+ RAG Skill 预处理器（skills.py），一行 apply() 完成预处理，支持多 Collection 路由 |
 
 ---
 
@@ -263,3 +263,31 @@ LLM 返回 tool_calls
 | `AGGREGATE_TOP_K` | `30` | aggregate 模式单次检索返回条数 |
 | `HYDE_ENABLED` | `false` | 是否启用 HyDE 查询扩展 |
 | `CHUNK_SIZE` | `512` | 文档分块大小（影响检索粒度） |
+
+---
+
+## 多 Collection 路由
+
+系统支持多个知识库 Collection（如 `workfile` 存放公司文件、`中医` 存放古籍文献）。LLM 在每次请求时会通过 system prompt 获取可用的 Collection 列表。
+
+```
+请求进入
+  ├─ RAG Skill 预处理
+  │   └─ _get_collections_hint() → 从 Qdrant 实时查询可用 Collection
+  │   └─ 注入到 system prompt: "当前可用的知识库集合: workfile, 中医, rag_documents"
+  │
+  └─ LLM 决策
+      ├─ "五运六气是什么" → search_knowledge_base(query="五运六气", collection="中医")
+      ├─ "佛吉亚公司简介" → search_knowledge_base(query="佛吉亚", collection="workfile")
+      └─ "列出中医知识库的文件" → list_documents(collection="中医")
+```
+
+所有 RAG 核心工具（search_knowledge_base、aggregate_documents、list_documents、delete_document、get_document_content）均支持 `collection` 参数，不传时使用 `.env` 中 `QDRANT_COLLECTION` 的默认值。
+
+---
+
+## OCR 解析质量检测
+
+MinerU 解析 PDF 后自动运行 `check_parse_quality()` 检测输出质量。算法基于孤立字符密度分析，区分 OCR 乱码与正常文档中的数字/英文缩写。
+
+检测结果（`score`、`is_garbled`、`details`）记录在日志中。若检测到乱码，文档的 `quality_warning` 字段会写入 Qdrant payload 的 metadata，检索时 LLM 可见此标记。

@@ -48,7 +48,9 @@ AI 模型层      ┌──────────────┼────�
 | **向量化索引** | BAAI/bge-m3 嵌入 + Qdrant 向量数据库，Dense + Sparse 双向量，支持批量索引与增量更新 | ✅ 已实现 |
 | **双路混合检索** | Dense（语义向量）+ Sparse（BGE-M3 词权重）双路召回，RRF 融合排序 | ✅ 已实现 |
 | **重排优化** | bge-reranker-v2-m3 Cross-Encoder 对召回结果精排 | ✅ 已实现 |
-| **双 LLM 后端** | 本地 Ollama（默认 qwen3-xlam）+ 远程 API（OpenAI 兼容，支持 DeepSeek/Groq 等），请求级切换 | ✅ 已实现 |
+| **双 LLM 后端** | 本地 Ollama + 远程 API（OpenAI 兼容，支持 DeepSeek/Groq 等），请求级切换 | ✅ 已实现 |
+| **多 Collection 支持** | 知识库可分 Collection 管理（如 `workfile` / `中医`），LLM 自动路由到正确的目标库 | ✅ 已实现 |
+| **OCR 质量检测** | MinerU 解析后自动检测乱码，在 metadata 打 quality_warning 标记 | ✅ 已实现 |
 | **查询路由** | 启动时自动生成知识库概括，提问时智能判断 chat/list_docs/aggregate/search 四种意图 | ✅ 已实现 |
 | **Open WebUI 集成** | 通过 OpenAI 兼容端点 `/v1/chat/completions` + `/v1/models` 接入 Open WebUI | ✅ 已实现 |
 | **文档列表查询** | 自然语言或 API 接口查询知识库中有哪些文件 | ✅ 已实现 |
@@ -91,7 +93,7 @@ AI 模型层      ┌──────────────┼────�
 
 ```bash
 # 宿主机上安装并启动 Ollama
-ollama pull qwen3-xlam:latest
+ollama pull qwen3:8b
 
 # 确认 Ollama 监听 11434 端口
 curl http://localhost:11434/api/tags
@@ -215,7 +217,7 @@ curl -X POST http://localhost:8000/ask \
 | `MINERU_TIMEOUT` | `600` | 单次 PDF 解析超时（秒） |
 | `OLLAMA_HOST` | `host.docker.internal` | Ollama 服务地址（本地: localhost，容器内: host.docker.internal） |
 | `OLLAMA_PORT` | `11434` | Ollama 服务端口 |
-| `OLLAMA_DEFAULT_MODEL` | `qwen3-xlam:latest` | 默认 Ollama 模型 |
+| `OLLAMA_DEFAULT_MODEL` | `qwen3:8b` | 默认 Ollama 模型 |
 | `LLM_PROVIDER` | `ollama` | LLM 后端（ollama / api） |
 | `API_DEFAULT_MODEL` | `deepseek-chat` | 远程 API 默认模型 |
 | `API_DEFAULT_BASE` | `https://api.deepseek.com` | 远程 API 地址 |

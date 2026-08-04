@@ -33,7 +33,7 @@ curl -s -X POST http://localhost:8000/ask \
 curl -s -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-xlam:latest",
+    "model": "deepseek-chat",
     "messages": [{"role": "user", "content": "知识库里有哪些文件？"}],
     "stream": true
   }' --no-buffer
@@ -333,8 +333,8 @@ curl -s -X POST http://localhost:8000/ask \
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `query` | string | ✅ | 用户问题 |
+| `collection` | string | | 目标知识库 Collection（如 `workfile` / `中医`），不传使用默认值 |
 | `filters` | object | | Metadata 过滤条件，支持 `*` 通配符 |
-| `collection` | string | | 目标 Collection，不传使用默认值 |
 | `llm_provider` | string | | `ollama` / `api` |
 | `llm_model` | string | | 模型名（覆盖默认值） |
 | `llm_api_base` | string | | API 地址（覆盖默认值） |
@@ -413,7 +413,9 @@ curl -s http://localhost:8000/v1/models | jq
 # → {
 #     "object": "list",
 #     "data": [
-#       {"id": "qwen3-xlam:latest", "object": "model", "owned_by": "ollama"},
+#     "data": [
+#       {"id": "qwen3:8b", "object": "model", "owned_by": "ollama"},
+#       {"id": "deepseek-chat", "object": "model", "owned_by": "api"},
 #       {"id": "deepseek-chat", "object": "model", "owned_by": "api"},
 #       ...
 #     ]
@@ -429,7 +431,7 @@ OpenAI 格式，支持流式 SSE。内部根据请求内容自动选择处理路
 curl -s -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-xlam:latest",
+    "model": "deepseek-chat",
     "messages": [
       {"role": "system", "content": "你是一个文档分析助手，请基于知识库回答问题。"},
       {"role": "user", "content": "总结一下文档的核心观点"}
@@ -451,7 +453,7 @@ curl -s -X POST http://localhost:8000/v1/chat/completions \
 curl -s -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3-xlam:latest",
+    "model": "deepseek-chat",
     "messages": [
       {"role": "user", "content": "知识库中有哪些报告？"},
       {"role": "assistant", "content": "知识库中有 3 份报告：A.pdf、B.docx、C.xlsx。"},

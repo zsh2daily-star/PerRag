@@ -60,10 +60,12 @@ AI 模型层      ┌──────────────┼────�
 | 模块 | 说明 | 状态 |
 |------|------|------|
 | **文档解析** | 支持 PDF（MinerU/pypdf/auto）、Word、PPT、Excel、Markdown、TXT 等多种格式 | ✅ 已实现 |
-| **向量化索引** | BAAI/bge-m3 嵌入 + Qdrant 向量数据库，Dense + Sparse 双向量，支持批量索引与增量更新 | ✅ 已实现 |
-| **双路混合检索** | Dense（语义向量）+ Sparse（BGE-M3 词权重）双路召回，RRF 融合排序 | ✅ 已实现 |
+| **向量化索引** | BAAI/bge-m3 嵌入 + Qdrant 向量数据库，Dense + Sparse 双向量，支持多 Collection 管理与批量索引 | ✅ 已实现 |
+| **双路混合检索** | Dense（语义向量）+ Sparse（BGE-M3 词权重）双路召回，RRF 融合排序，LLM 自动指定目标 Collection | ✅ 已实现 |
 | **重排优化** | bge-reranker-v2-m3 Cross-Encoder 对召回结果精排 | ✅ 已实现 |
-| **双 LLM 后端** | 本地 Ollama（默认 qwen3-xlam）+ 远程 API（OpenAI 兼容，支持 DeepSeek/Groq 等），请求级切换 | ✅ 已实现 |
+| **双 LLM 后端** | 本地 Ollama + 远程 API（OpenAI 兼容，支持 DeepSeek/Groq 等），请求级切换 | ✅ 已实现 |
+| **多 Collection 支持** | 知识库可分 Collection 管理，LLM 自动路由到正确的目标库 | ✅ 已实现 |
+| **OCR 质量检测** | MinerU 解析后自动检测乱码，在 metadata 打 quality_warning 标记 | ✅ 已实现 |
 | **查询路由** | 启动时自动生成知识库概括，提问时智能判断 chat/list_docs/aggregate/search 四种意图 | ✅ 已实现 |
 | **Open WebUI 集成** | 通过 OpenAI 兼容端点 `/v1/chat/completions` + `/v1/models` 接入 Open WebUI | ✅ 已实现 |
 | **文档列表查询** | 自然语言或 API 接口查询知识库中有哪些文件 | ✅ 已实现 |
@@ -134,9 +136,10 @@ rag-project/
 |------|------|------|----------|
 | `BAAI/bge-m3` | 嵌入向量（Dense）+ 词权重（Sparse） | ~2.2 GB | GPU 或 CPU |
 | `BAAI/bge-reranker-v2-m3` | Cross-Encoder 重排精排 | ~2.2 GB | GPU（推荐）或 CPU |
-| `qwen3-xlam:latest`（Ollama） | 对话生成 / tool-calling / 路由判断 | ~5.9 GB | GPU（推荐）或 CPU |
+| `qwen3:8b`（Ollama） | 对话生成 / 路由判断 | ~5.9 GB | GPU（推荐）或 CPU |
+| `deepseek-chat`（远程 API） | 对话生成 / function calling | — | 无 |
 
-> **显存参考**：BGE-M3 + Reranker 两个模型共约 3-4 GB 显存（fp16）。加上 qwen3-xlam（约 5.9 GB），推荐至少 **10 GB 显存**。如显存不足，可设置 `PDF_PARSER=pypdf` 关闭 MinerU（释放 GPU），或将 Ollama 放到其他机器。
+> **显存参考**：BGE-M3 + Reranker 两个模型共约 3-4 GB 显存（fp16）。如使用本地 Ollama 模型（约 5.9 GB），推荐至少 **10 GB 显存**。远程 API 模式下无需本地 LLM 显存。
 
 ### 模型缓存
 
