@@ -18,26 +18,20 @@ logger = logging.getLogger(__name__)
 
 # ── Agent 系统提示词 ────────────────────────────────────────
 
-HYBRID_RAG_APPENDIX = """\n\n---\n附加能力：你可以使用以下知识库工具搜索本地文档：
-- search_knowledge_base: 精确检索文档内容
-- aggregate_documents: 跨文档全局汇总分析
-- list_documents: 列出知识库中的文件列表
-- list_collections: 列出所有可用的知识库集合
+HYBRID_RAG_APPENDIX = """\n\n---\n你还可以使用以下本地知识库工具：
 
 {collections_note}
 
-【重要规则】这些知识库工具 ONLY 在以下情况使用：
-- 用户明确询问文档内容、知识库信息、文件相关问题
-- 用户说"搜索""查找""知识库里有没有""帮我查文档"等
-- 用户的问题需要从本地文件中获取事实/数据来回答
+- search_knowledge_base: 在知识库中搜索文档内容
+- aggregate_documents: 跨文档全局汇总分析
+- list_documents: 查看知识库中有哪些文件
+- index_file: 将单个文件导入知识库（支持 PDF/Word/Excel/PPT/Markdown/TXT）
+- index_directory: 批量导入整个目录
+- preview_document: 快速查看文件信息（不会重复解析）
+- delete_document: 从知识库中删除文件索引
+- list_collections: 查看有哪些知识库集合
 
-【禁止场景】以下情况绝对不要调用知识库工具：
-- 普通聊天、打招呼、闲聊
-- 执行外部工具操作（如发送消息到微信、发送邮件、操作设备等）
-- 用户的指令是让别的工具干活，不是在问文档问题
-- 任何与本地文件/知识库无关的请求
-
-如果不确定是否需要检索，默认不检索，直接回答或执行用户指定的外部工具。"""
+当用户提到文件导入、索引、检索、知识库管理时，优先考虑这些工具。"""
 
 
 def _get_collections_hint() -> str:
@@ -53,6 +47,29 @@ def _get_collections_hint() -> str:
         return "当前可用的知识库集合:\n  - " + "\n  - ".join(dense_cols)
     except Exception:
         return ""
+
+
+# ── 宿主机→容器路径转换 ───────────────────────────────────
+
+# Docker 挂载映射：宿主机路径前缀 → 容器内路径前缀
+# 用户对话中说宿主机路径，自动转成容器内路径
+_HOST_TO_CONTAINER_PATHS: dict[str, str] = {
+    "/mnt/个人文件": "/app/data/personal",
+    "/mnt/公司文件/公司内部文件": "/app/data/ragtemp",
+}
+
+
+def _to_container_path(path_str: str) -> str:
+    """将用户可能输入的宿主机路径转为容器内实际路径。
+
+    用户在对话中说的是宿主机路径（如 /mnt/个人文件/中医/xxx.pdf），
+    但工具执行时需要容器内路径（/app/data/personal/中医/xxx.pdf）。
+    如果路径已经是容器内路径则不转换。
+    """
+    for host_prefix, container_prefix in _HOST_TO_CONTAINER_PATHS.items():
+        if path_str.startswith(host_prefix):
+            return path_str.replace(host_prefix, container_prefix, 1)
+    return path_str
 
 
 # ── 工具实现 ─────────────────────────────────────────────────
@@ -137,52 +154,74 @@ def _tool_get_content(args: dict) -> str:
 
 
 def _tool_preview(args: dict) -> str:
-    """解析 + 分块预览。"""
-    from app.parser import parse_file
-
-    file_path = args.get("file_path", "")
+    """快速预览文件基本信息——不跑完整解析，避免对大 PDF 耗时过长。"""
+    file_path = _to_container_path(args.get("file_path", ""))
     path = Path(file_path)
     if not path.exists():
         return f"错误: 文件不存在 — {file_path}"
     if not path.is_file():
         return f"错误: 不是文件 — {file_path}"
 
-    parsed = parse_file(path)
+    size_kb = path.stat().st_size // 1024
+    suffix = path.suffix.lower()
 
-    from llama_index.core import Document as LlamaDocument
-    from app.indexer import _create_splitter
+    lines = [
+        f"文件: {path.name}",
+        f"大小: {size_kb:,} KB ({size_kb / 1024:.1f} MB)" if size_kb > 1024 else f"大小: {size_kb:,} KB",
+        f"格式: {suffix}",
+    ]
 
-    doc = LlamaDocument(text=parsed.text, metadata={"source": str(path)})
-    splitter = _create_splitter(settings.chunk_size, settings.chunk_overlap, settings.chunk_method)
-    nodes = splitter.get_nodes_from_documents([doc])
+    # PDF：快速获取页数 + 文本层探测
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+            lines.append(f"页数: {len(reader.pages)}")
 
-    samples = "\n".join(
-        f"  [{i}] {n.text[:120]}..." for i, n in enumerate(nodes[:3], 1)
-    )
-    return (
-        f"文件: {path.name}\n"
-        f"格式: {parsed.source_format}\n"
-        f"解析器: {parsed.source_format}\n"
-        f"总字符数: {len(parsed.text)}\n"
-        f"页数: {parsed.page_count or 'N/A'}\n"
-        f"分块策略: {settings.chunk_method} (size={settings.chunk_size}, overlap={settings.chunk_overlap})\n"
-        f"分块数: {len(nodes)}\n"
-        f"元数据: {parsed.metadata}\n"
-        f"前3块采样:\n{samples if samples else '  (无内容)'}"
-    )
+            # 只采样前 3 页，每页最多 500 字
+            samples: list[str] = []
+            for page in reader.pages[:3]:
+                text = (page.extract_text() or "").strip()
+                if text:
+                    samples.append(text[:500])
+            if samples:
+                lines.append(f"文字层: ✅ 可提取（前3页采样 {sum(len(s) for s in samples)} 字）")
+                lines.append("采样内容:")
+                for i, s in enumerate(samples, 1):
+                    lines.append(f"  [第{i}页] {s[:200]}...")
+            else:
+                lines.append("文字层: ❌ 无 → 可能是扫描件，需 MinerU OCR 才能解析")
+        except Exception as e:
+            lines.append(f"PDF 预览失败: {e}")
+
+    # 纯文本：直接采样前 1000 字
+    elif suffix in {".txt", ".md", ".markdown"}:
+        try:
+            text = path.read_text()[:1000]
+            lines.append(f"前 1000 字采样:\n  {text}")
+        except Exception as e:
+            lines.append(f"读取失败: {e}")
+
+    # 其他格式给基本文件信息就够了
+    else:
+        lines.append("提示: 使用 index_file / index_directory 导入后可检索内容")
+
+    return "\n".join(lines)
 
 
 def _tool_index_file(args: dict) -> str:
     """索引单个文件。"""
     from app.indexer import DocumentIndexer
 
-    file_path = args.get("file_path", "")
+    file_path = _to_container_path(args.get("file_path", ""))
     replace = args.get("replace", False)
+    collection = args.get("collection") or settings.qdrant_collection
     path = Path(file_path)
     if not path.exists():
         return f"错误: 文件不存在 — {file_path}"
 
     indexer = DocumentIndexer()
+    indexer._collection_override = collection
     try:
         chunks = indexer.index_file(path, replace=replace)
         from app.main import build_doc_list_cache
@@ -200,7 +239,7 @@ def _tool_index_dir(args: dict) -> str:
     import uuid
     from app.indexer import DocumentIndexer, _set_task_status
 
-    directory = args.get("directory", "")
+    directory = _to_container_path(args.get("directory", ""))
     replace = args.get("replace", False)
     async_mode = args.get("async_mode", False)
     dir_path = Path(directory)
@@ -217,10 +256,11 @@ def _tool_index_dir(args: dict) -> str:
         task_id = uuid.uuid4().hex[:12]
         _set_task_status(task_id, status="pending")
         import threading
+        collection = args.get("collection") or settings.qdrant_collection
         indexer = DocumentIndexer()
         t = threading.Thread(
             target=indexer.index_directory,
-            args=(dir_path, True, replace, False, None, task_id),
+            args=(dir_path, True, replace, False, collection, task_id),
             daemon=True,
         )
         t.start()
@@ -231,8 +271,9 @@ def _tool_index_dir(args: dict) -> str:
             f"可随时调 get_index_status 查进度。"
         )
 
-    indexer = DocumentIndexer()
-    result = indexer.index_directory(dir_path, replace=replace)
+    collection2 = args.get("collection") or settings.qdrant_collection
+    indexer2 = DocumentIndexer()
+    result = indexer2.index_directory(dir_path, replace=replace, collection=collection2)
     from app.main import build_doc_list_cache
     import threading
     threading.Thread(target=build_doc_list_cache, daemon=True).start()
@@ -262,22 +303,50 @@ def _tool_status(args: dict) -> str:
 
 
 def _tool_delete(args: dict) -> str:
-    """删除文档索引（按文件名匹配）。"""
-    from app.indexer import DocumentIndexer
-
+    """删除文档索引（按文件名精确匹配，仅展示信息，不执行删除）。"""
+    collection = args.get("collection") or settings.qdrant_collection
     filename = args.get("filename", "")
     if not filename:
         return "错误: filename 不能为空"
 
-    collection = args.get("collection") or settings.qdrant_collection
-    indexer = DocumentIndexer()
-    indexer._collection_override = collection
-    indexer._delete_by_filename(filename)
-    indexer._delete_sparse_by_filename(filename)
-    from app.main import build_doc_list_cache
-    import threading
-    threading.Thread(target=build_doc_list_cache, daemon=True).start()
-    return f"✓ 已从知识库删除: {filename}"
+    docs = _list_docs_qdrant(collection, filename)
+    if not docs:
+        return f"未找到文件「{filename}」，知识库 {collection} 中不存在此文件。"
+
+    doc = docs[0]
+    return (
+        f"文件「{filename}」在知识库 {collection} 中：\n"
+        f"  chunk 数: {doc['chunks']}\n"
+        f"  来源路径: {doc['source']}\n\n"
+        f"如需删除，请通过以下命令操作：\n"
+        f"curl -X DELETE http://rag-api:8000/index/document \\\n"
+        f"  -H \"Content-Type: application/json\" \\\n"
+        f"  -d '{{\"filename\": \"{filename}\", \"collection\": \"{collection}\"}}'"
+    )
+
+
+def _list_docs_qdrant(collection: str, filename: str) -> list[dict]:
+    """按文件名精确查询文档是否存在及 chunk 数。"""
+    from qdrant_client import QdrantClient
+    client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
+    existing = {c.name for c in client.get_collections().collections}
+    if collection not in existing:
+        return []
+    count = client.count(
+        collection_name=collection,
+        count_filter={"must": [{"key": "filename", "match": {"value": filename}}]},
+        exact=True,
+    )
+    if count.count == 0:
+        return []
+    # 拿一条看 source
+    points = client.scroll(
+        collection_name=collection, limit=1,
+        with_payload=["source"],
+        scroll_filter={"must": [{"key": "filename", "match": {"value": filename}}]},
+    )[0]
+    source = points[0].payload.get("source", "") if points else ""
+    return [{"filename": filename, "chunks": count.count, "source": source}]
 
 
 def _tool_aggregate(args: dict) -> str:
@@ -404,7 +473,7 @@ _registry: dict[str, dict[str, Any]] = {
         "handler": _tool_list_docs,
     },
     "get_document_content": {
-        "core": False,
+        "core": True,
         "definition": {
             "type": "function",
             "function": {
@@ -424,7 +493,7 @@ _registry: dict[str, dict[str, Any]] = {
         "handler": _tool_get_content,
     },
     "preview_document": {
-        "core": False,
+        "core": True,
         "definition": {
             "type": "function",
             "function": {
@@ -442,17 +511,18 @@ _registry: dict[str, dict[str, Any]] = {
         "handler": _tool_preview,
     },
     "index_file": {
-        "core": False,
+        "core": True,
         "definition": {
             "type": "function",
             "function": {
                 "name": "index_file",
-                "description": "索引单个文件到知识库。文件会被解析、分块、生成 Dense+Sparse 双向量后写入 Qdrant。索引完成后该文件即可被检索。",
+                "description": "将单个文件导入知识库（解析→分块→向量写入 Qdrant）。务必指定 collection 参数来导入到正确的知识库。支持 PDF/Word/Excel/PPT/Markdown/TXT。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "file_path": {"type": "string", "description": "服务器上的文件绝对路径，如 /app/data/uploads/report.pdf"},
-                        "replace": {"type": "boolean", "description": "如果该文件已索引，是否先删除旧数据再重新索引。默认 false。"},
+                        "file_path": {"type": "string", "description": "文件绝对路径"},
+                        "collection": {"type": "string", "description": "目标知识库集合，如 '中医' 或 'workfile'。务必填写！"},
+                        "replace": {"type": "boolean", "description": "是否先删除旧索引再重建。默认 false。"},
                     },
                     "required": ["file_path"],
                 },
@@ -461,18 +531,19 @@ _registry: dict[str, dict[str, Any]] = {
         "handler": _tool_index_file,
     },
     "index_directory": {
-        "core": False,
+        "core": True,
         "definition": {
             "type": "function",
             "function": {
                 "name": "index_directory",
-                "description": "批量索引整个目录中的所有支持文件（PDF/Word/Excel/PPT/Markdown/TXT），递归扫描子目录。大目录可能需要几分钟。",
+                "description": "批量索引目录中的所有文件。务必指定 collection 参数来导入到正确的知识库。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "directory": {"type": "string", "description": "服务器上的目录绝对路径，如 /app/data/uploads/"},
-                        "replace": {"type": "boolean", "description": "是否强制重建所有索引。默认 false（追加模式）。"},
-                        "async_mode": {"type": "boolean", "description": "是否异步执行。true=立即返回 task_id，false=等待完成。大目录推荐用 true。"},
+                        "directory": {"type": "string", "description": "目录绝对路径"},
+                        "collection": {"type": "string", "description": "目标知识库集合，如 '中医' 或 'workfile'。务必填写！"},
+                        "replace": {"type": "boolean", "description": "是否强制重建。默认 false。"},
+                        "async_mode": {"type": "boolean", "description": "异步执行返回 task_id。大目录推荐 true。"},
                     },
                     "required": ["directory"],
                 },
@@ -481,7 +552,7 @@ _registry: dict[str, dict[str, Any]] = {
         "handler": _tool_index_dir,
     },
     "get_index_status": {
-        "core": False,
+        "core": True,
         "definition": {
             "type": "function",
             "function": {
@@ -499,17 +570,17 @@ _registry: dict[str, dict[str, Any]] = {
         "handler": _tool_status,
     },
     "delete_document": {
-        "core": False,
+        "core": True,
         "definition": {
             "type": "function",
             "function": {
                 "name": "delete_document",
-                "description": "从知识库中按文件名删除一个文档的索引。不会删除磁盘上的原始文件。",
+                "description": "查看知识库中文档的详细信息并获取手动删除命令。此工具不执行删除，只返回文件信息和 curl 删除命令，让用户自行决定是否在终端执行。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "filename": {"type": "string", "description": "文档文件名（精确匹配），如 'report.pdf'。可先调 list_documents 获取文件名列表。"},
-                        "collection": {"type": "string", "description": "目标知识库集合名称。不传则使用默认集合。"},
+                        "filename": {"type": "string", "description": "文档文件名（精确匹配），如 'report.pdf'"},
+                        "collection": {"type": "string", "description": "目标知识库集合名称"},
                     },
                     "required": ["filename"],
                 },
@@ -518,7 +589,7 @@ _registry: dict[str, dict[str, Any]] = {
         "handler": _tool_delete,
     },
     "list_collections": {
-        "core": False,
+        "core": True,
         "definition": {
             "type": "function",
             "function": {
