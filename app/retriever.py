@@ -35,6 +35,29 @@ from app.models import get_embed_model, get_reranker, get_sparse_model
 
 logger = logging.getLogger(__name__)
 
+
+def _extract_text_from_payload(payload: dict | None) -> str:
+    """从 Qdrant point payload 中提取文本内容。
+
+    LlamaIndex QdrantVectorStore 把文本存在 _node_content JSON 的 text 字段中，
+    但部分旧数据或直接写入的 point 可能有扁平的 text 字段。两者都尝试。
+    """
+    if not payload:
+        return ""
+    # 优先扁平的 text 字段（兼容直接写入的 point）
+    if payload.get("text"):
+        return payload["text"]
+    # LlamaIndex 存在 _node_content JSON 里
+    nc_raw = payload.get("_node_content")
+    if nc_raw:
+        try:
+            nc = json.loads(nc_raw) if isinstance(nc_raw, str) else nc_raw
+            return nc.get("text", "") or ""
+        except (json.JSONDecodeError, TypeError):
+            return ""
+    return ""
+
+
 # 发给大模型的提示词模板
 # {context} 中的每段文档以 [N] 编号，LLM 回答时用 [N] 标注引用来源
 RAG_PROMPT = """\
@@ -170,7 +193,7 @@ class Retriever:
 
         return [
             {
-                "text": p.payload.get("text", "") if p.payload else "",
+                "text": _extract_text_from_payload(p.payload),
                 "source": p.payload.get("source", "") if p.payload else "",
                 "filename": p.payload.get("filename", "") if p.payload else "",
                 "score": round(p.score, 4),
@@ -226,7 +249,7 @@ class Retriever:
 
         return [
             {
-                "text": point.payload.get("text", "") if point.payload else "",
+                "text": _extract_text_from_payload(point.payload),
                 "source": point.payload.get("source", "") if point.payload else "",
                 "filename": point.payload.get("filename", "") if point.payload else "",
                 "score": round(point.score, 4),

@@ -503,7 +503,7 @@ class DocumentIndexer:
 
         directory = (directory or self.settings.import_dir).resolve()
         files = collect_files(directory, recursive=recursive,
-                               exclude_dirs=self.settings.exclude_dir_list)
+                               exclude_paths=self.settings.exclude_path_list)
 
         results: list[FileIndexResult] = []
         indexed = failed = skipped = total_chunks = 0

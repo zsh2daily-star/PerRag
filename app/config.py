@@ -72,7 +72,7 @@ class Settings:
 
     # ── 文档处理 ─────────────────────────────────────────
     import_dir: Path            # 待导入文档的默认目录
-    exclude_dirs: str | None   # 跳过索引的目录名，逗号分隔，如 "安全,测试"
+    exclude_paths: str | None  # 跳过索引的目录路径，逗号分隔，如 "不解析文件"（相对于 import_dir）
     chunk_size: int             # 文档分块每块最多多少 token（默认 512）
     chunk_overlap: int          # 相邻两块之间的重叠 token 数（默认 50，避免信息断联）
     chunk_method: str           # 分块策略：fixed（固定大小）/ semantic（按段落语义边界）
@@ -124,11 +124,11 @@ class Settings:
 
     # ── 计算属性 ─────────────────────────────────────────
     @property
-    def exclude_dir_list(self) -> list[str]:
-        """排除目录名列表（从逗号分隔字符串解析）。"""
-        if not self.exclude_dirs:
+    def exclude_path_list(self) -> list[str]:
+        """排除目录路径列表（从逗号分隔字符串解析）。"""
+        if not self.exclude_paths:
             return []
-        return [d.strip() for d in self.exclude_dirs.split(",") if d.strip()]
+        return [d.strip() for d in self.exclude_paths.split(",") if d.strip()]
 
     @property
     def mineru_base_url(self) -> str:
@@ -157,7 +157,7 @@ class Settings:
             qdrant_collection=os.getenv("QDRANT_COLLECTION", "rag_documents"),
             embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3"),
             import_dir=import_dir,
-            exclude_dirs=os.getenv("EXCLUDE_DIRS") or None,
+            exclude_paths=os.getenv("EXCLUDE_PATHS") or None,
             chunk_size=int(os.getenv("CHUNK_SIZE", "512")),
             chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "50")),
             chunk_method=os.getenv("CHUNK_METHOD", "fixed"),

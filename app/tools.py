@@ -146,9 +146,11 @@ def _tool_get_content(args: dict) -> str:
     if not results.points:
         return f"未找到文档: {filename}"
 
+    from app.retriever import _extract_text_from_payload
+
     parts = [f"文档《{filename}》的内容片段：\n"]
     for i, p in enumerate(results.points, 1):
-        text = p.payload.get("text", "") if p.payload else ""
+        text = _extract_text_from_payload(p.payload)
         parts.append(f"[Chunk {i}] {text[:800]}")
     return "\n\n".join(parts)
 
@@ -220,8 +222,30 @@ def _tool_index_file(args: dict) -> str:
     if not path.exists():
         return f"错误: 文件不存在 — {file_path}"
 
+    # 排除检查：与 index_directory 保持一致
+    for ex in settings.exclude_path_list:
+        ex_path = Path(ex)
+        if not ex_path.is_absolute():
+            # 相对路径：匹配文件名或父目录名
+            if ex_path.name == path.name or ex_path.name in [p.name for p in path.parents]:
+                return f"跳过: {path.name} — 在排除目录 ({ex}) 中"
+        else:
+            try:
+                if path.resolve().is_relative_to(ex_path.resolve()):
+                    return f"跳过: {path.name} — 在排除目录 ({ex}) 中"
+            except (ValueError, OSError):
+                pass
+
     indexer = DocumentIndexer()
     indexer._collection_override = collection
+
+    # 重复检查：避免重复导入大文件
+    if not replace and indexer._filename_exists(path.name):
+        return (
+            f"提示: {path.name} 已在知识库 {collection} 中。"
+            f"如需强制重建请设置 replace=true。"
+        )
+
     try:
         chunks = indexer.index_file(path, replace=replace)
         from app.main import build_doc_list_cache
@@ -248,7 +272,7 @@ def _tool_index_dir(args: dict) -> str:
         return f"错误: 目录不存在 — {directory}"
 
     from app.parser import collect_files
-    files = collect_files(dir_path, exclude_dirs=settings.exclude_dir_list)
+    files = collect_files(dir_path, exclude_paths=settings.exclude_path_list)
     if not files:
         return f"目录为空或无支持的文件: {directory}"
 

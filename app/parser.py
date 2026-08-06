@@ -498,9 +498,11 @@ def parse_docx(path: Path) -> ParsedDocument:
 def parse_xlsx(path: Path) -> ParsedDocument:
     """解析 Excel 文件，提取所有 sheet 中的文本。
 
-    每个 sheet 以 "--- sheet名 ---" 开头，
-    每行数据用 " | " 分隔。
+    每个 sheet 以 "--- sheet名 ---" 开头，每行数据用 " | " 分隔。
     忽略空单元格，跳过完全空的行。
+
+    sheet 内行用单个换行连接，sheet 间用双换行分隔，
+    这样分块器会把一个 sheet 当作连续文本块而非逐行切碎。
     """
     try:
         from openpyxl import load_workbook
@@ -510,28 +512,27 @@ def parse_xlsx(path: Path) -> ParsedDocument:
     # read_only=True: 只读模式，内存占用更低
     # data_only=True: 读取公式的计算结果而非公式本身
     wb = load_workbook(path, read_only=True, data_only=True)
-    parts: list[str] = []
+    sheet_texts: list[str] = []
     sheet_names: list[str] = []
 
     for sheet in wb.worksheets:
         sheet_names.append(sheet.title)
-        sheet_parts: list[str] = []
+        rows: list[str] = []
         for row in sheet.iter_rows(values_only=True):
             cells = [str(c) for c in row if c is not None]
             if cells:
-                sheet_parts.append(" | ".join(cells))
-        if sheet_parts:
-            parts.append(f"--- {sheet.title} ---")
-            parts.extend(sheet_parts)
+                rows.append(" | ".join(cells))
+        if rows:
+            sheet_texts.append(f"--- {sheet.title} ---\n" + "\n".join(rows))
 
     wb.close()
 
-    if not parts:
+    if not sheet_texts:
         raise ValueError(f"无法从 Excel 文件中提取文本: {path.name}")
 
     return ParsedDocument(
-        text="\n\n".join(parts),
-        metadata={"sheets": ", ".join(sheet_names)},
+        text="\n\n".join(sheet_texts),
+        metadata={"sheet_count": len(sheet_names)},
         source_format="xlsx",
     )
 
@@ -710,13 +711,13 @@ def parse_file(path: Path) -> ParsedDocument:
 
 
 def collect_files(directory: Path, recursive: bool = True,
-                  exclude_dirs: list[str] | None = None) -> list[Path]:
+                  exclude_paths: list[str] | None = None) -> list[Path]:
     """扫描目录，返回所有支持文件的排序列表。
 
     参数:
         directory: 要扫描的目录
         recursive: 是否递归扫描子目录
-        exclude_dirs: 要跳过的目录名列表（路径中任一部分匹配即跳过）
+        exclude_paths: 要跳过的目录路径列表（相对路径相对于 directory 解析）
 
     返回:
         按路径排序的文件列表（仅含 SUPPORTED_EXTENSIONS 中的类型）
@@ -724,13 +725,22 @@ def collect_files(directory: Path, recursive: bool = True,
     if not directory.is_dir():
         raise NotADirectoryError(f"目录不存在: {directory}")
 
-    exclude = exclude_dirs or []
+    # 解析排除路径：相对路径相对于 directory 解析
+    resolved_exclude: list[Path] = []
+    for p_str in (exclude_paths or []):
+        p = Path(p_str)
+        if not p.is_absolute():
+            p = (directory / p).resolve()
+        else:
+            p = p.resolve()
+        resolved_exclude.append(p)
+
     pattern = "**/*" if recursive else "*"
     files = [
         p
         for p in directory.glob(pattern)
         if p.is_file()
         and p.suffix.lower() in SUPPORTED_EXTENSIONS
-        and not any(e in p.parts for e in exclude)
+        and not any(p.resolve().is_relative_to(ex) for ex in resolved_exclude)
     ]
     return sorted(files)

@@ -31,7 +31,7 @@ services:
       - CHUNK_OVERLAP=${CHUNK_OVERLAP:-50}
       - PDF_PARSER=${PDF_PARSER:-mineru}
       - IMPORT_DIR=/app/data/uploads
-      - EXCLUDE_DIRS=${EXCLUDE_DIRS:-}
+      - EXCLUDE_PATHS=${EXCLUDE_PATHS:-}
       # MinerU PDF 解析
       - MINERU_HOST=mineru
       - MINERU_PORT=8000

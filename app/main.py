@@ -367,7 +367,7 @@ def index_preview(directory: str | None = None, recursive: bool = True):
     if not dir_path.is_dir():
         raise HTTPException(status_code=404, detail=f"目录不存在: {dir_path}")
     files = collect_files(dir_path, recursive=recursive,
-                           exclude_dirs=settings.exclude_dir_list)
+                           exclude_paths=settings.exclude_path_list)
     return {
         "directory": str(dir_path.resolve()),
         "total_files": len(files),
@@ -408,7 +408,7 @@ def index_directory_async(body: IndexDirectoryRequest, background_tasks: Backgro
         task_id,  # 传入 task_id，indexer 会实时更新进度
     )
     files = collect_files(dir_path, recursive=body.recursive,
-                           exclude_dirs=settings.exclude_dir_list)
+                           exclude_paths=settings.exclude_path_list)
     return {
         "message": "索引任务已在后台启动",
         "task_id": task_id,
@@ -1006,22 +1006,29 @@ def _parse_xml_tool_calls(content: str) -> tuple[str | None, list[dict] | None]:
         <parameter name="query">巴普</parameter>
         </invoke>
         </tool_calls>
+
+    也支持裸 <invoke>（无外层 <tool_calls> 包裹）：
+        <invoke name="list_documents">
+        <parameter name="collection">workfile</parameter>
+        </invoke>
     """
     if not content:
         return (content, None)
 
-    pattern = r'<tool_calls>\s*(.*?)\s*</tool_calls>'
-    match = re.search(pattern, content, re.DOTALL)
-    if not match:
-        return (content, None)
-
-    xml_block = match.group(0)
-    inner = match.group(1)
+    # 先尝试 <tool_calls> 包裹格式
+    wrapper_match = re.search(r'<tool_calls>\s*(.*?)\s*</tool_calls>', content, re.DOTALL)
+    if wrapper_match:
+        inner = wrapper_match.group(1)
+    else:
+        # 降级：匹配裸 <invoke>（DeepSeek 偶尔省略外层 <tool_calls>）
+        if not re.search(r'<invoke\s+name="[^"]+">', content):
+            return (content, None)
+        inner = content
 
     # 解析每个 <invoke> 块
-    invoke_pattern = r'<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>'
+    invoke_re = r'<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>'
     parsed: list[dict] = []
-    for im in re.finditer(invoke_pattern, inner, re.DOTALL):
+    for im in re.finditer(invoke_re, inner, re.DOTALL):
         func_name = im.group(1)
         params_block = im.group(2)
         args: dict = {}
@@ -1042,7 +1049,11 @@ def _parse_xml_tool_calls(content: str) -> tuple[str | None, list[dict] | None]:
         return (content, None)
 
     # 去除 XML 块，返回干净内容
-    clean = content[:match.start()] + content[match.end():]
+    if wrapper_match:
+        clean = content[:wrapper_match.start()] + content[wrapper_match.end():]
+    else:
+        # 裸 invoke：逐个去除每个 <invoke>...</invoke> 块
+        clean = re.sub(invoke_re, '', content, flags=re.DOTALL)
     clean = clean.strip()
 
     logger = logging.getLogger(__name__)
@@ -1103,8 +1114,10 @@ def _run_hybrid_agent(
         if not tool_calls and content:
             content, tool_calls = _parse_xml_tool_calls(content)
         # 有 tool_calls 时清理 content 中残留的 XML 文本
-        if tool_calls and content and '<tool_calls>' in content:
-            content = re.sub(r'<tool_calls>.*?</tool_calls>\s*', '', content, flags=re.DOTALL).strip() or None
+        if tool_calls and content and ('<tool_calls>' in content or '<invoke' in content):
+            content = re.sub(r'<tool_calls>.*?</tool_calls>\s*', '', content, flags=re.DOTALL)
+            content = re.sub(r'<invoke\s+name="[^"]+">\s*.*?\s*</invoke>\s*', '', content, flags=re.DOTALL)
+            content = content.strip() or None
 
         if tool_calls:
             # 记录 assistant 的 tool_calls 消息
@@ -1223,8 +1236,10 @@ def _stream_hybrid_agent(
         if not tool_calls and content:
             content, tool_calls = _parse_xml_tool_calls(content)
         # 有 tool_calls 时清理 content 中残留的 XML 文本
-        if tool_calls and content and '<tool_calls>' in content:
-            content = re.sub(r'<tool_calls>.*?</tool_calls>\s*', '', content, flags=re.DOTALL).strip() or None
+        if tool_calls and content and ('<tool_calls>' in content or '<invoke' in content):
+            content = re.sub(r'<tool_calls>.*?</tool_calls>\s*', '', content, flags=re.DOTALL)
+            content = re.sub(r'<invoke\s+name="[^"]+">\s*.*?\s*</invoke>\s*', '', content, flags=re.DOTALL)
+            content = content.strip() or None
 
         if tool_calls:
             # 显示工具名
