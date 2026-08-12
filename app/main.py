@@ -1242,15 +1242,11 @@ def _stream_hybrid_agent(
             content = content.strip() or None
 
         if tool_calls:
-            # 显示工具名
+            # 显示工具名（仅日志，不发送给客户端——避免手机端展示内部调试信息）
             tool_names = [
                 tc.get("function", {}).get("name", "?")
                 for tc in tool_calls
             ]
-            yield _build_sse(
-                chat_id, created, request_model,
-                delta={"content": f"🔧 {', '.join(tool_names)}...\n"},
-            )
 
             chat_messages.append({
                 "role": "assistant",
@@ -1296,15 +1292,7 @@ def _stream_hybrid_agent(
                     "tool_call_id": tc.get("id", ""),
                     "content": tool_result,
                 })
-                short = (
-                    tool_result[:300] + "..."
-                    if len(tool_result) > 300
-                    else tool_result
-                )
-                yield _build_sse(
-                    chat_id, created, request_model,
-                    delta={"content": short + "\n\n"},
-                )
+                # 不将工具结果发送给客户端——内部执行过程不应泄漏到手机端
 
             continue  # 回到 LLM
 
