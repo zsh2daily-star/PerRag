@@ -785,10 +785,23 @@ class Retriever:
         data = response.json()
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+        finish_reason = choice.get("finish_reason", "stop")
+
+        # 诊断日志：确认 LLM 是返回原生 tool_calls 还是把工具调用写进 content（XML）
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "API chat 响应: finish=%s, tool_calls=%s, content 前 200 字=%.200r",
+            finish_reason,
+            tool_calls,
+            content or "",
+        )
+
         return {
-            "content": msg.get("content"),
-            "tool_calls": msg.get("tool_calls"),
-            "finish_reason": choice.get("finish_reason", "stop"),
+            "content": content,
+            "tool_calls": tool_calls,
+            "finish_reason": finish_reason,
         }
 
     def _stream_api_chat(

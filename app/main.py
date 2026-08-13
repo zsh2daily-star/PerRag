@@ -993,6 +993,25 @@ def _expand_query(query: str) -> list[str]:
             f"{core} 统计",
         ]
     return expanded[:3]
+
+
+# 弯引号/全角引号 → ASCII 引号。国内 LLM（DeepSeek/Qwen 等）常输出中文弯引号
+# “ ”（U+201C/U+201D），而正则按 ASCII " 匹配，需先归一化。
+_QUOTE_TRANS = str.maketrans({
+    '“': '"', '”': '"',   # “ ”
+    '„': '"', '‟': '"',   # „ ‟
+    '＂': '"',                   # ＂ 全角引号
+    '‘': "'", '’': "'",   # ‘ ’
+    '‚': "'", '‛': "'",   # ‚ ‛
+    '＇': "'",                   # ＇ 全角单引号
+})
+
+
+def _normalize_quotes(text: str) -> str:
+    """把弯引号/全角引号归一化为 ASCII 引号，供 XML tool call 正则匹配。"""
+    return text.translate(_QUOTE_TRANS)
+
+
 def _parse_xml_tool_calls(content: str) -> tuple[str | None, list[dict] | None]:
     """从 LLM 文本输出中提取 XML 格式的 tool_calls，返回 (clean_content, tool_calls)。
 
@@ -1007,6 +1026,9 @@ def _parse_xml_tool_calls(content: str) -> tuple[str | None, list[dict] | None]:
         </invoke>
         </tool_calls>
 
+    也支持带类型标注的参数（Claude/Anthropic XML 风格）：
+        <parameter name="collection" string="true">workfile</parameter>
+
     也支持裸 <invoke>（无外层 <tool_calls> 包裹）：
         <invoke name="list_documents">
         <parameter name="collection">workfile</parameter>
@@ -1015,25 +1037,39 @@ def _parse_xml_tool_calls(content: str) -> tuple[str | None, list[dict] | None]:
     if not content:
         return (content, None)
 
+    # 归一化引号（弯引号 → ASCII），否则正则匹配不到中文 LLM 输出的 XML 属性
+    content = _normalize_quotes(content)
+
     # 先尝试 <tool_calls> 包裹格式
     wrapper_match = re.search(r'<tool_calls>\s*(.*?)\s*</tool_calls>', content, re.DOTALL)
     if wrapper_match:
         inner = wrapper_match.group(1)
     else:
         # 降级：匹配裸 <invoke>（DeepSeek 偶尔省略外层 <tool_calls>）
-        if not re.search(r'<invoke\s+name="[^"]+">', content):
+        # [^>]* 匹配 invoke 标签上可能存在的额外属性（如 string="true"）
+        if not re.search(r'<invoke\s+name="[^"]+"[^>]*>', content):
             return (content, None)
         inner = content
 
-    # 解析每个 <invoke> 块
-    invoke_re = r'<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>'
+    # 解析每个 <invoke> 块 —— [^>]* 兼容额外属性
+    invoke_re = r'<invoke\s+name="([^"]+)"[^>]*>\s*(.*?)\s*</invoke>'
+    # 参数正则：name 值后面可以有任意其他属性（如 string="true"），[^>]* 跳过它们
+    param_re = r'<parameter\s+name="([^"]+)"[^>]*>(.*?)</parameter>'
+
     parsed: list[dict] = []
     for im in re.finditer(invoke_re, inner, re.DOTALL):
         func_name = im.group(1)
         params_block = im.group(2)
         args: dict = {}
-        for pm in re.finditer(r'<parameter\s+name="([^"]+)">(.*?)</parameter>', params_block, re.DOTALL):
+        for pm in re.finditer(param_re, params_block, re.DOTALL):
             args[pm.group(1)] = pm.group(2).strip()
+
+        if not args:
+            # 没解析到参数也不放弃 —— 至少把 invoke name 记录下来
+            logger_warn = logging.getLogger(__name__)
+            logger_warn.warning(
+                "XML invoke %s 未提取到有效参数，原始块: %.200s", func_name, params_block
+            )
 
         call_id = f"call_xml_{uuid.uuid4().hex[:8]}"
         parsed.append({
@@ -1089,6 +1125,10 @@ def _run_hybrid_agent(
 
     retriever = get_retriever()
 
+    # 搜索结果去重追踪：连续 N 轮无新结果 → 强制停止搜索
+    _last_search_sig: str | None = None
+    _stale_search_rounds = 0
+
     for round_num in range(1, MAX_HYBRID_ROUNDS + 1):
         logger.info("Hybrid Agent 第 %d 轮: %d 条消息, %d 个工具",
                      round_num, len(chat_messages), len(tools))
@@ -1115,8 +1155,9 @@ def _run_hybrid_agent(
             content, tool_calls = _parse_xml_tool_calls(content)
         # 有 tool_calls 时清理 content 中残留的 XML 文本
         if tool_calls and content and ('<tool_calls>' in content or '<invoke' in content):
+            content = _normalize_quotes(content)
             content = re.sub(r'<tool_calls>.*?</tool_calls>\s*', '', content, flags=re.DOTALL)
-            content = re.sub(r'<invoke\s+name="[^"]+">\s*.*?\s*</invoke>\s*', '', content, flags=re.DOTALL)
+            content = re.sub(r'<invoke\s+name="[^"]+"[^>]*>\s*.*?\s*</invoke>\s*', '', content, flags=re.DOTALL)
             content = content.strip() or None
 
         if tool_calls:
@@ -1146,6 +1187,7 @@ def _run_hybrid_agent(
                 }
 
             # 全是 RAG 工具 → 内部执行
+            round_search_sig: str | None = None
             for tc in tool_calls:
                 func_name = tc.get("function", {}).get("name", "")
                 func_args_raw = tc.get("function", {}).get("arguments", "{}")
@@ -1165,6 +1207,38 @@ def _run_hybrid_agent(
                 })
                 logger.info("Hybrid Agent: 执行 RAG 工具 %s → %d chars",
                              func_name, len(tool_result))
+
+                # 累积本轮搜索结果的「指纹」
+                if func_name == "search_knowledge_base":
+                    lines = tool_result.strip().split("\n")
+                    sig = str(len(lines)) + "|" + tool_result[:200]
+                    round_search_sig = (
+                        sig if round_search_sig is None
+                        else round_search_sig + "||" + sig
+                    )
+
+            # 检测搜索结果是否与前一轮相同
+            if round_search_sig is not None:
+                if round_search_sig == _last_search_sig:
+                    _stale_search_rounds += 1
+                else:
+                    _stale_search_rounds = 0
+                _last_search_sig = round_search_sig
+
+            if _stale_search_rounds >= 2:
+                logger.info(
+                    "Hybrid Agent: 连续 %d 轮搜索无新结果，强制终止",
+                    _stale_search_rounds,
+                )
+                chat_messages.append({
+                    "role": "user",
+                    "content": (
+                        "[系统提示] 已经连续搜索了多轮，每次返回的搜索结果完全相同，"
+                        "说明知识库中没有更多相关信息。请直接根据已有信息回答用户问题，"
+                        "诚实告知哪些信息找到了、哪些没有找到。不要再调用搜索工具。"
+                    ),
+                })
+                break
 
             continue  # 回到 LLM
 
@@ -1210,6 +1284,10 @@ def _stream_hybrid_agent(
         yield "data: [DONE]\n\n"
         return
 
+    # 搜索结果去重追踪：连续 N 轮无新结果 → 强制停止搜索
+    _last_search_sig: str | None = None
+    _stale_search_rounds = 0
+
     for round_num in range(1, MAX_HYBRID_ROUNDS + 1):
         logger.info("Hybrid Agent 流式第 %d 轮", round_num)
 
@@ -1237,8 +1315,9 @@ def _stream_hybrid_agent(
             content, tool_calls = _parse_xml_tool_calls(content)
         # 有 tool_calls 时清理 content 中残留的 XML 文本
         if tool_calls and content and ('<tool_calls>' in content or '<invoke' in content):
+            content = _normalize_quotes(content)
             content = re.sub(r'<tool_calls>.*?</tool_calls>\s*', '', content, flags=re.DOTALL)
-            content = re.sub(r'<invoke\s+name="[^"]+">\s*.*?\s*</invoke>\s*', '', content, flags=re.DOTALL)
+            content = re.sub(r'<invoke\s+name="[^"]+"[^>]*>\s*.*?\s*</invoke>\s*', '', content, flags=re.DOTALL)
             content = content.strip() or None
 
         if tool_calls:
@@ -1266,15 +1345,20 @@ def _stream_hybrid_agent(
                     "Hybrid Agent 流式: 外部工具 %s → 返回给 Hermes",
                     tool_names,
                 )
+                # OpenAI 流式规范要求每个 tool_call 带 index，否则接收方无法解析
+                indexed_tool_calls = [
+                    {**tc, "index": i} for i, tc in enumerate(tool_calls)
+                ]
                 yield _build_sse(
                     chat_id, created, request_model,
-                    delta={"tool_calls": tool_calls},
+                    delta={"tool_calls": indexed_tool_calls},
                     finish_reason="tool_calls",
                 )
                 yield "data: [DONE]\n\n"
                 return
 
             # RAG 工具 → 内部执行，输出结果
+            round_search_sig: str | None = None
             for tc in tool_calls:
                 func_name = tc.get("function", {}).get("name", "")
                 func_args_raw = tc.get("function", {}).get("arguments", "{}")
@@ -1293,6 +1377,39 @@ def _stream_hybrid_agent(
                     "content": tool_result,
                 })
                 # 不将工具结果发送给客户端——内部执行过程不应泄漏到手机端
+
+                # 累积本轮搜索结果的「指纹」（文件名列表 + 行数）
+                if func_name == "search_knowledge_base":
+                    lines = tool_result.strip().split("\n")
+                    sig = str(len(lines)) + "|" + tool_result[:200]
+                    round_search_sig = (
+                        sig if round_search_sig is None
+                        else round_search_sig + "||" + sig
+                    )
+
+            # 检测搜索结果是否与前一轮相同（去重追踪）
+            if round_search_sig is not None:
+                if round_search_sig == _last_search_sig:
+                    _stale_search_rounds += 1
+                else:
+                    _stale_search_rounds = 0
+                _last_search_sig = round_search_sig
+
+            if _stale_search_rounds >= 2:
+                logger.info(
+                    "Hybrid Agent 流式: 连续 %d 轮搜索无新结果，强制终止搜索",
+                    _stale_search_rounds,
+                )
+                chat_messages.append({
+                    "role": "user",
+                    "content": (
+                        "[系统提示] 已经连续搜索了多轮，每次返回的搜索结果完全相同，"
+                        "说明知识库中没有更多相关信息。请直接根据已有信息回答用户问题，"
+                        "诚实告知哪些信息找到了、哪些没有找到。不要再调用搜索工具。"
+                    ),
+                })
+                # 跳出 for 循环，让 LLM 生成最终回答
+                break
 
             continue  # 回到 LLM
 

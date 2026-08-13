@@ -13,3 +13,6 @@ models/
 # Python
 __pycache__/
 *.pyc
+
+# 个人踩坑笔记（不纳入版本控制）
+docs/TOOL-PASSTHROUGH-FIX.md
