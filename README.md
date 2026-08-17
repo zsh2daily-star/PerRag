@@ -4,40 +4,43 @@
 
 > 📖 **详细文档**：
 > - [项目架构与模块说明](docs/ARCHITECTURE.md) — 架构图、服务拓扑、项目结构、模型与硬件
-> - [路由与检索详解](docs/ROUTING.md) — 路由树、检索流程、HyDE、Aggregate、Tool 透传、Hybrid Agent
+> - [路由与检索详解](docs/ROUTING.md) — 简单 RAG、混合检索、HyDE、Aggregate、MCP 检索
 > - [API 接口文档](docs/API.md) — 端点总览、参数说明、curl 示例、CLI 导入
 
 ## 架构概览
 
 ```
-用户交互层     ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-              │  Open WebUI  │  │Hermes WebUI │  │  REST API    │  │  CLI 工具    │
-              │  (聊天前端)   │  │ (聊天前端)   │  │  (FastAPI)   │  │  (import)   │
-              └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-                     │                 │                 │                 │
-应用服务层           └────────┬────────┴────────┬────────┘                 │
-                     ┌────────┴────────┐                │                │
-                     │  FastAPI 应用    │◄───────────────┴────────────────┘
-                     │  ├─ Router      │  查询路由分发（chat/search/aggregate/list_docs）
-                     │  ├─ Retriever   │  混合检索（Dense+Sparse→RRF→Rerank）+ LLM 生成
-                     │  ├─ Indexer     │  文档索引（解析→分块→双向量写入 Qdrant）
-                     │  └─ Parser      │  多格式解析（PDF/Word/Excel/PPT/Markdown/TXT）
+用户交互层     ┌──────────────┐  ┌──────────────┐
+              │  Open WebUI  │  │Hermes WebUI │
+              │  (聊天前端)   │  │ (聊天前端)   │
+              └──────┬───────┘  └──────┬───────┘
+                     │  直连 deepseek   │  直连 deepseek
+                     │   + MCP 检索     │   + MCP 检索
                      └────────┬────────┘
                               │
-AI 模型层      ┌──────────────┼──────────────┐
-              │               │              │
-         ┌────▼────┐   ┌─────▼──────┐  ┌────▼────────────┐
-         │  Ollama │   │ BGE-M3     │  │ BGE-Reranker    │
-                  │ Qwen3-8B │   │ (Embedding)│  │ (Cross-Encoder) │
-         │  (宿主机) │   │   Dense +  │  │ 重排精排         │
-         │         │   │   Sparse   │  │                 │
-         └─────────┘   └────────────┘  └─────────────────┘
-              │
-数据存储层     ┌──────────────┐  ┌──────────────┐
-              │   Qdrant     │  │  MinerU      │
-              │  (向量数据库) │  │  (PDF解析)   │
-              │  Dense+Sparse│  │  GPU OCR     │
-              └──────────────┘  └──────────────┘
+MCP 检索服务     ┌────────────▼────────┐
+              │       rag-mcp        │  MCP server（streamable-http）
+              │  ├─ search/list/docs │  混合检索（Dense+Sparse→RRF→Rerank）
+              │  ├─ get_content      │  文档内容查询
+              │  ├─ index            │  文档索引（解析→分块→双向量写入 Qdrant）
+              │  └─ delete/preview   │  删除 / 预览
+              └────────┬────────┘
+                       │
+AI 模型层      ┌────────┼────────┐
+              │                 │
+         ┌────▼────┐   ┌───────▼─────┐  ┌─────────────────┐
+         │ DeepSeek│   │   BGE-M3    │  │  BGE-Reranker   │
+         │ (远程API)│   │ (Embedding) │  │ (Cross-Encoder) │
+         └─────────┘   │  Dense+     │  │  重排精排        │
+                       │  Sparse     │  └─────────────────┘
+                       └─────────────┘
+                       │
+数据存储层     ┌────────┼────────┐
+              │                 │
+         ┌────▼────┐   ┌───────▼─────┐
+         │  Qdrant │   │   MinerU    │
+         │(向量数据库)│  │  (PDF解析)  │
+         └─────────┘   └─────────────┘
 ```
 
 ## 核心特性
@@ -48,41 +51,35 @@ AI 模型层      ┌──────────────┼────�
 | **向量化索引** | BAAI/bge-m3 嵌入 + Qdrant 向量数据库，Dense + Sparse 双向量，支持批量索引与增量更新 | ✅ 已实现 |
 | **双路混合检索** | Dense（语义向量）+ Sparse（BGE-M3 词权重）双路召回，RRF 融合排序 | ✅ 已实现 |
 | **重排优化** | bge-reranker-v2-m3 Cross-Encoder 对召回结果精排 | ✅ 已实现 |
-| **双 LLM 后端** | 本地 Ollama + 远程 API（OpenAI 兼容，支持 DeepSeek/Groq 等），请求级切换 | ✅ 已实现 |
-| **多 Collection 支持** | 知识库可分 Collection 管理（如 `workfile` / `中医`），LLM 自动路由到正确的目标库 | ✅ 已实现 |
+| **MCP 检索服务** | 10 个检索/索引工具暴露为标准 MCP（rag-mcp），供 Hermes / Open WebUI 直连 deepseek 时统一编排 | ✅ 已实现 |
+| **多 Collection 支持** | 知识库可分 Collection 管理（如 `workfile` / `中医`） | ✅ 已实现 |
 | **OCR 质量检测** | MinerU 解析后自动检测乱码，在 metadata 打 quality_warning 标记 | ✅ 已实现 |
-| **查询路由** | 启动时自动生成知识库概括，提问时智能判断 chat/list_docs/aggregate/search 四种意图 | ✅ 已实现 |
+| **简单 RAG 问答** | `/v1/chat/completions` + `/ask` 走检索 + LLM 生成，无 agent 循环 | ✅ 已实现 |
 | **Open WebUI 集成** | 通过 OpenAI 兼容端点 `/v1/chat/completions` + `/v1/models` 接入 Open WebUI | ✅ 已实现 |
 | **文档列表查询** | 自然语言或 API 接口查询知识库中有哪些文件 | ✅ 已实现 |
 | **跨文档聚合** | 多轮检索 + 汇总去重 + LLM 全局统计分析 | ✅ 已实现 |
-| **Tool 透传 RAG 注入** | Hermes WebUI 请求自动注入知识库上下文，无需额外配置 | ✅ 已实现 |
-| **Hybrid Agent 循环** | RAG 工具内部执行 + 外部工具透传 Hermes，最多 6 轮 | ✅ 已实现 |
 | **文档列表缓存** | 启动时构建，内存读取零 QPS，索引变更自动刷新 | ✅ 已实现 |
-| **扩展检索** | 检测"所有/汇总"关键词，自动多角度补充检索扩大召回 | ✅ 已实现 |
-| **对话历史持久化** | SQLite 存储，跨重启保留多轮对话上下文 | ✅ 已实现 |
-| **多轮对话 RAG** | 历史感知的检索查询构建 + 对话上下文传递给 LLM | ✅ 已实现 |
 
 ## 服务拓扑
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Open WebUI  │────▶│   rag-api    │────▶│   Qdrant     │
-│  (端口:3000)  │     │  (核心:8000) │     │  (向量:6333) │
+┌──────────────┐     ┌──────────────┐
+│  Open WebUI  │────▶│  DeepSeek    │
+│  (端口:3000)  │     │ (api.deepseek)│
+└──────┬───────┘     └──────────────┘
+       │ MCP 检索
+┌──────▼───────┐     ┌──────────────┐     ┌──────────────┐
+│Hermes WebUI │────▶│   rag-mcp    │────▶│   Qdrant     │
+│  (端口:6060) │     │  (MCP:8001)  │     │  (向量:6333) │
 └──────────────┘     └──────┬───────┘     └──────────────┘
-                            │  ▲
-┌──────────────┐            │  │  OpenAI 兼容端点
-│Hermes WebUI │────────────┘  │  /v1/models
-│  (端口:6060)  │               │  /v1/chat/completions
-└──────────────┘               │
-              ┌─────────────┼─────────────┐
-              │             │             │
-        ┌─────▼─────┐ ┌────▼────┐ ┌──────▼──────┐
-        │  MinerU   │ │ Ollama  │ │ API Remote  │
-        │ (解析:30001)│ │(宿主机) │ │ (DeepSeek)  │
-        └───────────┘ └─────────┘ └─────────────┘
+                            │  PDF 解析
+                     ┌──────▼───────┐
+                     │    MinerU    │
+                     │  (端口:30001) │
+                     └──────────────┘
 ```
 
-> **说明**：Open WebUI 通过 Docker Compose 一同部署，默认端口 3000。Hermes WebUI 通过 `shared-rag` Docker 网络连接 rag-api 的 OpenAI 兼容端点。Ollama 运行在宿主机，不包含在 Docker 编排中。
+> **说明**：Open WebUI 与 Hermes WebUI 都直连 DeepSeek，检索通过 MCP 调用 rag-mcp（`rag-mcp:8001/mcp`）→ Qdrant。rag-mcp 复用 tools.py 的检索/索引 handler。MinerU 提供 PDF OCR 解析。
 
 ## 快速开始
 
@@ -123,34 +120,26 @@ cp .env .env.local
 docker compose up -d --build
 
 # 5. 查看日志
-docker compose logs -f rag-api
+docker compose logs -f rag-mcp
 
-# 6. 健康检查
-curl http://localhost:8000/health
+# 6. 健康检查（rag-mcp MCP 端点）
+curl http://localhost:8001/mcp
 ```
 
 ### 导入文档
 
-**方式一：API 接口**
+**方式一：MCP 工具**（在 Open WebUI / Hermes 里让模型调用）
 
-```bash
-# 将文档放到 data/uploads 目录
-cp /path/to/your/docs/*.pdf data/uploads/
-
-# 通过 API 触发同步索引
-curl -X POST http://localhost:8000/index/directory \
-  -H "Content-Type: application/json" \
-  -d '{"directory": "/app/data/uploads", "recursive": true, "replace": false}'
-```
+在聊天里让模型调用 `index_file`（单个文件）或 `index_directory`（目录）工具即可导入。
 
 **方式二：CLI 工具**
 
 ```bash
 # 进入容器后使用 CLI 导入（更适合批量场景）
-docker exec rag-api python -m app.import_docs --dir /app/data/uploads
+docker exec rag-mcp python -m app.import_docs --dir /app/data/uploads
 
 # 索引到指定 collection
-docker exec rag-api python -m app.import_docs \
+docker exec rag-mcp python -m app.import_docs \
   --dir /app/data/uploads --collection my_custom_collection
 
 # 可选参数：
@@ -162,36 +151,17 @@ docker exec rag-api python -m app.import_docs \
 
 ### 开始提问
 
-```bash
-# 使用本地 Ollama
-curl -X POST http://localhost:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{"query": "知识库中有哪些关于机器学习的文档？"}'
+问答在 Open WebUI（端口 3000）或 Hermes WebUI（端口 6060）里进行：
 
-# 切换到远程 DeepSeek
-curl -X POST http://localhost:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "总结文档的主要内容",
-    "llm_provider": "api",
-    "llm_model": "deepseek-chat",
-    "llm_api_key": "sk-your-key-here"
-  }'
-```
+1. 前端直连 DeepSeek（模型选 `deepseek-chat`）
+2. 前端通过 MCP 连接 rag-mcp（`http://rag-mcp:8001/mcp`）
+3. 提问时模型自动调用 `search_knowledge_base` 等工具检索知识库
 
-## 对话前端与分析接口
+## 对话前端
 
-三种使用方式：Open WebUI（已集成，端口 3000）、Hermes WebUI（外部连接）、CLI 命令行。
+两种使用方式：**Open WebUI**（端口 3000）、**Hermes WebUI**（端口 6060），都直连 DeepSeek + MCP 检索。
 
-11 个 REST 端点：基础接口（health/info/preview）、索引管理（同步/异步）、文档列表、跨文档聚合、核心问答、OpenAI 兼容端点（models/chat completions）。
-
-完整接口文档、参数说明和 curl 示例见 **[docs/API.md](docs/API.md)**。
-
-## Tool 透传 RAG 增强
-
-所有请求统一走 **Hybrid Agent 循环**：补齐 RAG 工具 + 保留原始 system prompt + LLM 自主决策。RAG 工具内部执行，外部工具（Hermes 的 web_search 等）外抛，最多 6 轮。
-
-详见 **[docs/ROUTING.md](docs/ROUTING.md#v1chatcompletions-路由树)** 和 **[docs/API.md](docs/API.md#tool-透传-rag-增强hermes-webui-专用)**。
+完整配置说明见 **[docs/API.md](docs/API.md)**。
 
 ## 项目结构与模型
 
@@ -233,28 +203,17 @@ curl -X POST http://localhost:8000/ask \
 | `MULTIMODAL_ENABLED` | `false` | 是否启用 MinerU 图片提取 |
 | `RAG_API_KEY` | `` | API 鉴权密钥，留空不启用 |
 | `HF_HOME` | `/app/models` | HuggingFace 模型缓存目录 |
-| `RAG_API_PORT` | `8000` | RAG API 对外端口 |
+| `RAG_MCP_PORT` | `8001` | RAG MCP 检索服务对外端口 |
 | `OPENWEBUI_PORT` | `3000` | Open WebUI 对外端口 |
 | `WEBUI_SECRET_KEY` | `change-me-in-production` | Open WebUI JWT 密钥 |
 
 > **注意**：上表展示的是 Docker Compose 环境下的默认值。本地开发时，`app/config.py:119` 中的默认值有所不同（如 `QDRANT_HOST=localhost`、`OLLAMA_HOST=localhost`），Docker Compose 中的 `environment` 配置会覆盖这些默认值。
 
-## 查询路由机制
-
-系统启动时会自动分析 Qdrant 中所有 Collection 的内容，用 LLM 生成每个知识库的内容概括。每次提问时，路由器根据概括 + 用户问题判断该执行哪种行动：
-
-| Action | 场景 | 处理方式 |
-|--------|------|----------|
-| `search` | 具体内容查询 | 双路混合检索 → 重排 → LLM 生成 |
-| `aggregate` | 全局统计/汇总 | 跨文档聚合分析 |
-| `list_docs` | 列出文档列表 | 从 Qdrant payload 提取文件名去重 |
-| `chat` | 闲聊/常识 | 直接 LLM 回答，不使用知识库 |
-
 ## 检索架构
 
-所有请求自动经过 **RAG Skill** 预处理（`rag_skill.apply()` 一行完成 system prompt 增补 + tools 补齐），然后进入**统一 Hybrid Agent**（LLM 自主决策：搜索/聚合/闲聊/外抛外部工具，最多 6 轮）。
-
 完整检索链路：**HyDE（可选）→ Dense + Sparse（各 30 条）→ RRF → Rerank → Top 5 → LLM**。
+
+检索能力通过 MCP 暴露（rag-mcp），供 Open WebUI / Hermes 直连 deepseek 时统一编排调用。
 
 详见 **[docs/ROUTING.md](docs/ROUTING.md)**。
 
@@ -305,8 +264,8 @@ ruff check app/ --fix
 | MinerU 解析失败 | 无 GPU 或 GPU 内存不足 | 设置 `PDF_PARSER=pypdf` 降级为纯文字解析 |
 | 无法连接 Ollama | 宿主机防火墙或网络问题 | 检查 `OLLAMA_HOST` 配置，确认 `curl http://localhost:11434/api/tags` 可通 |
 | Qdrant 连接失败 | 容器未启动或网络不通 | `docker compose ps qdrant` 确认状态，本地开发需设置 `QDRANT_HOST=localhost` |
-| Open WebUI 不显示模型 | `/v1/models` 返回空 | 确认 Ollama 有已拉取的模型，检查 `rag-api` 日志 |
-| 首次查询很慢 | 模型正在后台加载 | 查看 `docker compose logs rag-api` 等待预热完成（约 30-60s） |
+| Open WebUI 不显示模型 | `/v1/models` 返回空 | 确认 Ollama 有已拉取的模型，检查 `rag-mcp` 日志 |
+| 首次查询很慢 | 模型正在后台加载 | 查看 `docker compose logs rag-mcp` 等待预热完成（约 30-60s） |
 | GPU 内存不足 | 同时加载 Embedding + Reranker 模型 | 两个模型共约 3-4GB 显存，确保 GPU 有足够可用内存 |
 | 检索结果不准 | 文档未正确分块或索引 | 减小 `CHUNK_SIZE`、增大 `RERANK_TOP_K`，或检查文档解析质量 |
 | Hermes WebUI 连接失败 | 容器不在同一网络 | `docker network connect shared-rag hermes-webui` |

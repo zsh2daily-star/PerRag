@@ -176,10 +176,7 @@ if __name__ == "__main__":
 
     mcp.settings.host = os.getenv("MCP_HOST", "0.0.0.0")
     mcp.settings.port = int(os.getenv("MCP_PORT", "8001"))
-    # DNS rebinding 保护默认只允许 localhost，会拒绝容器名（如 rag-mcp:8001）。
-    # 这里放开 localhost + 容器名，否则 Hermes 通过 url 访问会被 421 拒绝。
-    mcp.settings.transport_security.allowed_hosts = [
-        "localhost:*", "127.0.0.1:*", "[::1]:*",
-        "rag-mcp:*", "rag-api:*",
-    ]
+    # DNS rebinding 保护默认只允许 localhost，会拒绝容器名和局域网 IP。
+    # 这里直接禁用保护，允许任何 host 访问（供 Docker 容器名 + 局域网机器通过宿主机 IP 连接）。
+    mcp.settings.transport_security.enable_dns_rebinding_protection = False
     mcp.run(transport="streamable-http")

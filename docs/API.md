@@ -4,19 +4,28 @@
 
 ### Open WebUI（已集成）
 
-启动后访问 `http://localhost:3000`，首次使用需注册账号（数据存储在 `data/openwebui` 中）。Open WebUI 自动通过 `/v1/models` 发现可用模型，对话时内部走完整 RAG 链路。
+启动后访问 `http://localhost:3000`，首次使用需注册账号（数据存储在 `data/openwebui` 中）。Open WebUI 自动通过 `/v1/models` 发现可用模型，对话时走简单 RAG（检索 + LLM 生成）。
 
 ### Hermes WebUI（外部连接）
 
-Hermes WebUI 通过 `shared-rag` Docker 网络与 rag-api 通信。在 Hermes WebUI 中添加 OpenAI 兼容后端：
+Hermes WebUI 现在**直连 DeepSeek**，检索通过 **MCP** 调用 rag-mcp 服务。配置位于 Hermes 的 `~/.hermes/config.yaml`：
 
-- **API Base URL**: `http://rag-api:8000/v1`
-- **API Key**: 留空（RAG API 不强制鉴权）
+```yaml
+model:
+  default: deepseek-chat
+  provider: custom:deepseek
 
-确保 Hermes WebUI 容器已加入 `shared-rag` 网络：
+custom_providers:
+  - name: deepseek
+    base_url: https://api.deepseek.com/v1
+    api_key: sk-xxx
+    model: deepseek-chat
+    api_mode: chat_completions
 
-```bash
-docker network connect shared-rag hermes-webui
+mcp_servers:
+  rag-search:
+    url: http://rag-mcp:8001/mcp
+    enabled: true
 ```
 
 ### CLI 命令行对话
@@ -29,26 +38,24 @@ curl -s -X POST http://localhost:8000/ask \
   -H "Content-Type: application/json" \
   -d '{"query": "总结文档的主要内容"}' | jq -r '.answer'
 
-# 流式输出（逐字打印，体验更好）
+# OpenAI 兼容端点（/v1/chat/completions，简单 RAG，非流式）
 curl -s -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
-    "messages": [{"role": "user", "content": "知识库里有哪些文件？"}],
-    "stream": true
-  }' --no-buffer
+    "messages": [{"role": "user", "content": "知识库里有哪些文件？"}]
+  }' | jq -r '.choices[0].message.content'
 
 # 切换远程模型（DeepSeek）
 curl -s -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
-    "messages": [{"role": "user", "content": "文档中的核心观点是什么？"}],
-    "stream": true
-  }' --no-buffer
+    "messages": [{"role": "user", "content": "文档中的核心观点是什么？"}]
+  }' | jq -r '.choices[0].message.content'
 ```
 
-> **提示**：流式接口 `/v1/chat/completions` 支持 system prompt，可传 `{"role": "system", "content": "你是一个文档分析助手..."}` 来控制助手行为。
+> **提示**：`/v1/chat/completions` 现在是简单 RAG（非流式），不支持 `stream` 参数。
 
 ### CLI 文档导入
 
@@ -56,7 +63,7 @@ curl -s -X POST http://localhost:8000/v1/chat/completions \
 
 ```bash
 # 进入容器执行
-docker exec rag-api python -m app.import_docs --dir /app/data/uploads
+docker exec rag-mcp python -m app.import_docs --dir /app/data/uploads
 
 # 或本地开发时直接运行
 python -m app.import_docs --dir /path/to/docs
@@ -72,19 +79,19 @@ python -m app.import_docs --dir /path/to/docs
 
 ```bash
 # 索引到指定 collection
-docker exec rag-api python -m app.import_docs \
+docker exec rag-mcp python -m app.import_docs \
   --dir /app/data/uploads --collection my_custom_collection
 
 # 增量导入（只处理新增文件，跳过已索引的）
-docker exec rag-api python -m app.import_docs \
+docker exec rag-mcp python -m app.import_docs \
   --dir /app/data/uploads --skip-existing
 
 # 强制重建索引（数据更新后重新导入）
-docker exec rag-api python -m app.import_docs \
+docker exec rag-mcp python -m app.import_docs \
   --dir /app/data/uploads --replace
 
 # 仅当前目录不递归
-docker exec rag-api python -m app.import_docs \
+docker exec rag-mcp python -m app.import_docs \
   --dir /app/data/uploads --no-recursive
 ```
 
@@ -112,7 +119,7 @@ docker exec rag-api python -m app.import_docs \
 | `POST` | `/aggregate` | 跨文档全局统计/汇总 |
 | `POST` | `/ask` | 核心问答接口（检索 + LLM 生成） |
 | `GET` | `/v1/models` | OpenAI 兼容：列出可用模型 |
-| `POST` | `/v1/chat/completions` | OpenAI 兼容：聊天补全（流式 SSE） |
+| `POST` | `/v1/chat/completions` | OpenAI 兼容：聊天补全（简单 RAG） |
 
 ---
 
@@ -424,7 +431,7 @@ curl -s http://localhost:8000/v1/models | jq
 
 #### `POST /v1/chat/completions` — 聊天补全
 
-OpenAI 格式，支持流式 SSE。内部根据请求内容自动选择处理路径（详见 [ROUTING.md](ROUTING.md#v1chatcompletions-路由树)）。
+OpenAI 格式（简单 RAG，非流式）。提取用户最后一条消息作为查询，检索知识库 + LLM 生成回答。
 
 ```bash
 # 基础用法 —— 与 ChatGPT API 格式一致
@@ -449,7 +456,7 @@ curl -s -X POST http://localhost:8000/v1/chat/completions \
     ]
   }' | jq
 
-# 多轮对话（自动使用最后一条 user 消息检索）
+# 多轮历史（简单 RAG 只取最后一条 user 消息作为查询）
 curl -s -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -466,31 +473,21 @@ curl -s -X POST http://localhost:8000/v1/chat/completions \
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `model` | string | | 模型名，不传使用默认 Ollama 模型 |
+| `model` | string | | 模型名，不传使用默认 DeepSeek 模型 |
 | `messages` | array | ✅ | 消息列表，标准 OpenAI 格式 |
-| `stream` | bool | | 是否流式输出（SSE），默认 `false` |
-| `tools` | array | | 工具列表（带 RAG 工具走 Agent 模式，其他走透传） |
+| `stream` | bool | | 已废弃（简单 RAG 不支持流式） |
 | `temperature` | float | | 采样温度，默认 `0.3` |
 
-**内部路由逻辑**：
+**内部逻辑**：
 
-所有请求自动经过 RAG Skill 预处理（`rag_skill.apply()`：system prompt 增补 + tools 补齐），然后进入统一 Hybrid Agent。LLM 自主决策，最多 6 轮。RAG 工具内部执行，外部工具外抛。
+提取用户最后一条消息作为查询 → 混合检索（Dense+Sparse → RRF → Rerank）→ 拼接上下文 → LLM 生成回答。无 agent 循环、无工具透传。
 
 ---
 
-## Hybrid Agent 统一路由
+## 简单 RAG 问答
 
-`rag_skill.apply()` 自动完成 system prompt 增补 + tools 补齐后进入 Hybrid Agent 循环。LLM 自主决策：RAG 工具内部执行，外部工具外抛给调用方（如 Hermes 的 web_search、terminal），最多 6 轮。
+`/v1/chat/completions` 与 `/ask` 都是简单 RAG（检索 + LLM 生成）。检索工具另以 MCP 服务（`rag-mcp`）暴露，供 Hermes 直连 deepseek 时统一编排（详见 [ROUTING.md](ROUTING.md)）。
 
 ### 文档列表缓存
 
 启动时后台从 Qdrant scroll 全量构建文档列表缓存。list_documents 工具直接读内存，索引/删除操作后自动异步刷新。
-
-### 常见问题覆盖
-
-| 用户问题 | LLM 决策 |
-|----------|----------|
-| "知识库里有什么文件" | 调 list_documents → 读缓存 |
-| "A 报告讲什么" | 调 search_knowledge_base → 检索 |
-| "汇总所有合同金额" | 调 aggregate_documents → 多轮扩展 |
-| 闲聊 / 常识 | 不调工具，直接回答 |

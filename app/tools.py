@@ -1,7 +1,7 @@
 """Agent Tools —— 将 Qdrant 操作和文档解析包装为 LLM 可调用的函数。
 
-注册表模式：每个 tool 一条记录（name → {definition, handler, core}）。
-新增工具只需加一条记录，TOOLS / CORE_TOOLS / execute_tool 全部自动生成。
+注册表模式：每个 tool 一条记录（name → {definition, handler, core}），
+供 MCP server 直接复用 handler。
 """
 
 from __future__ import annotations
@@ -15,44 +15,6 @@ from qdrant_client import QdrantClient
 from app.config import settings
 
 logger = logging.getLogger(__name__)
-
-# ── Agent 系统提示词 ────────────────────────────────────────
-
-HYBRID_RAG_APPENDIX = """\n\n---\n你还可以使用以下本地知识库工具：
-
-{collections_note}
-
-- search_knowledge_base: 在知识库中搜索文档内容
-- aggregate_documents: 跨文档全局汇总分析
-- list_documents: 查看知识库中有哪些文件
-- index_file: 将单个文件导入知识库（支持 PDF/Word/Excel/PPT/Markdown/TXT）
-- index_directory: 批量导入整个目录
-- preview_document: 快速查看文件信息（不会重复解析）
-- delete_document: 从知识库中删除文件索引
-- list_collections: 查看有哪些知识库集合
-
-当用户提到文件导入、索引、检索、知识库管理时，优先考虑这些工具。
-
-⚠️ 搜索纪律：
-- 每轮最多调用 search_knowledge_base 2-3 次，用不同的关键词方向即可
-- 如果搜索结果的相关度都很低（<0.5），说明知识库中没有相关信息，直接诚实告知用户
-- 不要用同样的 query 反复搜索，一次就够了"""
-
-
-def _get_collections_hint() -> str:
-    """动态生成可用 collection 列表提示（从 Qdrant 实时获取）。"""
-    try:
-        client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
-        cols = client.get_collections().collections
-        dense_cols = sorted(
-            c.name for c in cols if not c.name.endswith("_sparse")
-        )
-        if not dense_cols:
-            return "（暂无可用知识库集合）"
-        return "当前可用的知识库集合:\n  - " + "\n  - ".join(dense_cols)
-    except Exception:
-        return ""
-
 
 # ── 宿主机→容器路径转换 ───────────────────────────────────
 
@@ -630,36 +592,3 @@ _registry: dict[str, dict[str, Any]] = {
         "handler": _tool_list_collections,
     },
 }
-
-
-# ── 自动推导的公共接口 ──────────────────────────────────────
-
-TOOLS: list[dict] = [t["definition"] for t in _registry.values()]
-
-CORE_TOOLS: list[dict] = [
-    t["definition"] for t in _registry.values() if t["core"]
-]
-
-_AGENT_TOOL_NAMES: set[str] = set(_registry.keys())
-_CORE_TOOL_NAMES: set[str] = {k for k, t in _registry.items() if t["core"]}
-
-
-def execute_tool(name: str, arguments: dict) -> str:
-    """执行一个 tool 调用，返回结果字符串给 LLM。
-
-    根据注册表自动分发，不再需要手动 if/elif 链。
-    """
-    logger.info("Agent tool: %s(%s)", name, arguments)
-    tool = _registry.get(name)
-    if not tool:
-        return f"错误: 未知工具 {name}"
-    try:
-        return tool["handler"](arguments)
-    except Exception as e:
-        logger.exception("Tool %s 执行失败", name)
-        return f"错误: {name} 执行失败 — {e}"
-
-
-def is_rag_tool(name: str) -> bool:
-    """判断工具名是否属于 RAG 内部工具（用于区分外部工具）。"""
-    return name in _AGENT_TOOL_NAMES

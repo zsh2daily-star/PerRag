@@ -1,51 +1,48 @@
-# 路由、检索与 Tool 透传详解
+# 路由与检索详解
 
-## 查询路由机制（`/ask` 端点）
+## `/ask` 端点（简单 RAG）
 
-系统启动时会自动分析 Qdrant 中所有 Collection 的内容，用 LLM 生成每个知识库的内容概括。每次提问时，路由器根据概括 + 用户问题判断该执行哪种行动：
+`/ask` 与 `/v1/chat/completions` 一样，都是简单 RAG 问答（检索 + LLM 生成），不做路由判断：
 
-| Action | 场景 | 处理方式 |
-|--------|------|----------|
-| `search` | 具体内容查询 | 双路混合检索 → 重排 → LLM 生成 |
-| `aggregate` | 全局统计/汇总 | 跨文档聚合分析 |
-| `list_docs` | 列出文档列表 | 从 Qdrant payload 提取文件名去重 |
-| `chat` | 闲聊/常识 | 直接 LLM 回答，不使用知识库 |
+```
+/ask
+│
+└─ retriever.ask(query)
+     ├─ 混合检索（Dense+Sparse → RRF → Rerank）
+     ├─ 拼接 Top-K 文档上下文
+     └─ LLM 生成回答 → 返回 {query, answer, sources}
+```
 
 ---
 
-## `/v1/chat/completions` 路由树
+## `/v1/chat/completions` 路由（v5：简单 RAG）
 
-所有请求自动经过 RAG Skill 预处理后，统一走 Hybrid Agent。
+现在 `/v1/chat/completions` 是**简单 RAG 问答**（不再有 Hybrid Agent 循环）：
 
 ```
 POST /v1/chat/completions
 │
-│  ┌─ RAG Skill（自动触发）─────────────────────────────┐
-│  │  rag_skill.apply(messages, tools)                             │
-│  │    1. _augment_system_prompt() — 保留原始身份 + 追加 RAG 描述   │
-│  │    2. _ensure_rag_tools()     — 补齐 search/aggregate/list     │
-│  └─────────────────────────────────────────────────────────────┘
-│
-└─ 【统一 Hybrid Agent 循环】最多 6 轮
-    LLM 自主决策:
-      - 闲聊              → 直接回答，不调工具
-      - 查文档             → search_knowledge_base  → 内部检索
-      - 汇总统计           → aggregate_documents   → 内部聚合
-      - 列出文件           → list_documents        → 读缓存
-      - 外部工具 (Hermes)  → 外抛 tool_calls
-    RAG 工具 rag-api 内部执行，外部工具透传给 Hermes
+├─ 提取用户最后一条消息作为 query
+├─ retriever.ask(query)
+│     ├─ 混合检索（Dense+Sparse → RRF → Rerank）
+│     ├─ 拼接 Top-K 文档上下文
+│     └─ LLM 生成回答
+└─ 返回 OpenAI 兼容格式
 ```
 
-> **LLM 后端**：系统支持双后端：本地 Ollama（默认 `qwen3:8b`，用于轻量路由判断）和远程 DeepSeek API（默认 `deepseek-chat`，用于 function calling 和 RAG 问答）。远程模型支持 tool_calls，是 Agent 模式下推荐的后端。模型可通过请求 body 中的 `model` 字段指定，不在 Ollama 列表中的模型名自动走远程 API。
+检索能力同时以 **MCP 工具**形式独立暴露（`rag-mcp` 服务 + `app/mcp_server.py`），供 Hermes 直连 deepseek 时通过 MCP 调用；openwebui 走上面的简单 RAG 端点。
+
+> **LLM 后端**：默认远程 DeepSeek API（`deepseek-chat`）。模型可通过请求 body 中的 `model` 字段指定，不在 Ollama 列表中的模型名自动走远程 API。
 
 ### 路由演进
 
 | 版本 | 逻辑 |
 |------|------|
 | v1 | 三条分支：Agent / Tool 透传(ollama注入 vs api Hybrid) / 纯RAG |
-| v2（上一步） | ollama 上下文注入 + api Hybrid Agent，通过 `route_query` 判断意图 |
+| v2 | ollama 上下文注入 + api Hybrid Agent，通过 `route_query` 判断意图 |
 | v3 | 统一 Hybrid Agent，换 xLAM 模型后 ollama 也走 Agent 循环 |
-| v4（当前） | 注册表模式（tools.py）+ RAG Skill 预处理器（skills.py），一行 apply() 完成预处理，支持多 Collection 路由 |
+| v4 | 注册表模式（tools.py）+ RAG Skill 预处理器（skills.py），一行 apply() 完成预处理，支持多 Collection 路由 |
+| v5（当前） | 移除 Hybrid Agent 循环，改为简单 RAG（检索 + 生成）；检索能力独立成 MCP 服务（rag-mcp），供 Hermes 直连 deepseek 统一编排 |
 
 ---
 
@@ -205,25 +202,30 @@ LLM 生成假设答案: "具备市场前景良好、技术方案可行、团队�
 
 ---
 
-## Hybrid Agent 循环（统一入口）
+## 检索工具与 MCP（v5 当前）
 
-所有请求经过 RAG Skill 预处理后进入 Hybrid Agent 循环。LLM 收到完整 tools 列表（RAG 工具 + 原始外部工具）后自主决策，最多 6 轮。
+检索工具（search_knowledge_base 等 10 个）不再内嵌于 Agent 循环，而是独立成 **MCP 服务**（`rag-mcp` 容器 + `app/mcp_server.py`），复用 `tools.py` 的 handler。
 
-### 工具分类策略
+### 10 个 MCP 工具
 
-```
-LLM 返回 tool_calls
-  │
-  ├─ 全部是 RAG 工具（search / aggregate / list / delete 等）
-  │   → rag-api 内部执行 → 结果追加到 conversation → 继续 LLM 循环
-  │
-  ├─ 混合 RAG + 外部工具（web_search / terminal / read_file / ...）
-  │   → 包装所有 tool_calls → 返回给调用方（如 Hermes）→ 循环结束
-  │
-  └─ 无 tool_calls → 最终回答，循环结束
+| 工具 | 作用 |
+|------|------|
+| search_knowledge_base | 混合检索（Dense+Sparse → RRF → Rerank） |
+| aggregate_documents | 跨文档汇总去重 |
+| list_documents | 列出文档（读缓存） |
+| get_document_content | 获取文档 chunk 原文 |
+| preview_document | 预览文件（不解析） |
+| index_file / index_directory | 导入文件 / 目录 |
+| get_index_status | 查询异步索引进度 |
+| delete_document | 查看文档信息 + 删除命令 |
+| list_collections | 列出 collection |
 
-最多 6 轮，每轮约 3 秒（纯检索，不调 LLM 生成）
-```
+### 两种调用方式
+
+| 调用方 | 方式 |
+|--------|------|
+| Hermes | 直连 deepseek + MCP 调用 rag-search（`rag-mcp:8001/mcp`） |
+| openwebui | `/v1/chat/completions` 简单 RAG（检索 + 生成） |
 
 ### 文档列表缓存
 
@@ -231,13 +233,12 @@ LLM 返回 tool_calls
 
 ### 常见问题覆盖
 
-| 用户问题 | LLM 决策 |
+| 用户问题 | 对应工具 |
 |----------|----------|
-| "知识库里有什么文件" | 调 list_documents → 读缓存返回 |
-| "A 报告讲什么" | 调 search_knowledge_base → 检索 → 生成 |
-| "汇总所有合同金额" | 调 aggregate_documents → 多轮扩展检索 |
-| "删掉这个文件" | 调 delete_document → 删除索引 |
-| 闲聊 / 常识 | 不调任何工具，直接回答 |
+| "知识库里有什么文件" | list_documents → 读缓存返回 |
+| "A 报告讲什么" | search_knowledge_base → 检索 |
+| "汇总所有合同金额" | aggregate_documents → 跨文档聚合 |
+| "删掉这个文件" | delete_document |
 
 ---
 
@@ -268,21 +269,14 @@ LLM 返回 tool_calls
 
 ## 多 Collection 路由
 
-系统支持多个知识库 Collection（如 `workfile` 存放公司文件、`中医` 存放古籍文献）。LLM 在每次请求时会通过 system prompt 获取可用的 Collection 列表。
+系统支持多个知识库 Collection（如 `workfile` 存放公司文件、`中医` 存放古籍文献）。所有检索工具均支持 `collection` 参数，不传时使用 `.env` 中 `QDRANT_COLLECTION` 的默认值：
 
 ```
-请求进入
-  ├─ RAG Skill 预处理
-  │   └─ _get_collections_hint() → 从 Qdrant 实时查询可用 Collection
-  │   └─ 注入到 system prompt: "当前可用的知识库集合: workfile, 中医, rag_documents"
-  │
-  └─ LLM 决策
-      ├─ "五运六气是什么" → search_knowledge_base(query="五运六气", collection="中医")
-      ├─ "佛吉亚公司简介" → search_knowledge_base(query="佛吉亚", collection="workfile")
-      └─ "列出中医知识库的文件" → list_documents(collection="中医")
+# MCP 调用时指定 collection
+search_knowledge_base(query="佛吉亚", collection="workfile")
+search_knowledge_base(query="五运六气", collection="中医")
+list_documents(collection="中医")
 ```
-
-所有 RAG 核心工具（search_knowledge_base、aggregate_documents、list_documents、delete_document、get_document_content）均支持 `collection` 参数，不传时使用 `.env` 中 `QDRANT_COLLECTION` 的默认值。
 
 ---
 

@@ -14,9 +14,7 @@
     POST /v1/chat/completions OpenAI 兼容聊天补全（供 Open WebUI 接入）
 """
 
-import json
 import logging
-import re
 import threading
 import time
 import uuid
@@ -25,16 +23,13 @@ from typing import Any
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from app.config import resolve_api_key, settings
 from app.indexer import DocumentIndexer, DirectoryIndexResult
 from app.parser import SUPPORTED_EXTENSIONS, collect_files
-from app.retriever import Retriever, get_retriever
-from app.router import get_summaries
-from app.tools import TOOLS, execute_tool, is_rag_tool
-from app.skills import rag_skill
+from app.retriever import get_retriever
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,7 +98,6 @@ def metrics_endpoint():
             status_code=503,
         )
     # 更新文档数量指标
-    from app.conversation_store import DB_PATH as _unused  # noqa: F401
     try:
         from qdrant_client import QdrantClient
         client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
@@ -157,9 +151,9 @@ async def api_key_middleware(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup_warmup():
-    """应用启动时后台预热：模型加载 + 知识库概括生成。
+    """应用启动时后台预热：模型加载 + 文档列表缓存构建。
 
-    模型加载（BGE-M3 + Reranker）和知识库概括都在后台线程并行执行，
+    模型加载（BGE-M3 + Reranker）和文档列表缓存构建都在后台线程并行执行，
     不影响 FastAPI 立即接受请求。首次请求时如果预热未完成会自动阻塞等待。
     """
     from app.models import warmup_models
@@ -168,8 +162,7 @@ async def startup_warmup():
     logger.info("启动预热：开始后台加载模型...")
     warmup_models(blocking=False)
 
-    # 预热知识库概括 + 文档列表缓存（后台线程，不需要等待模型就绪）
-    threading.Thread(target=get_summaries, daemon=True).start()
+    # 预热文档列表缓存（后台线程，不需要等待模型就绪）
     threading.Thread(target=build_doc_list_cache, daemon=True).start()
 
 
@@ -180,6 +173,7 @@ _lock = threading.Lock()
 
 
 def get_indexer() -> DocumentIndexer:
+    """获取全局唯一的 DocumentIndexer 单例（线程安全的 double-checked locking）。"""
     global _indexer
     if _indexer is None:
         with _lock:
@@ -222,6 +216,7 @@ def _run_index_directory(
 
 
 class IndexDirectoryRequest(BaseModel):
+    """目录索引请求模型。"""
     directory: str | None = Field(
         default=None,
         description="本地目录路径，默认使用 IMPORT_DIR 环境变量的值",
@@ -242,6 +237,7 @@ class IndexDirectoryRequest(BaseModel):
 
 
 class IndexDirectoryResponse(BaseModel):
+    """目录索引响应模型。"""
     directory: str
     total_files: int
     indexed: int
@@ -269,6 +265,7 @@ class AskRequest(BaseModel):
 
 
 class AskResponse(BaseModel):
+    """问答响应模型：query + answer + sources。"""
     query: str
     answer: str
     sources: list[dict]
@@ -293,29 +290,29 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    """OpenAI 兼容的聊天补全请求。
+    """OpenAI 兼容的聊天补全请求（简单 RAG，非流式）。
 
-    支持 tool calling：当 tools 非空时，自动切换为透传模式，
-    绕过 RAG 检索链路，直接将 messages + tools 转发给 LLM。
+    提取最后一条 user 消息作为查询，检索知识库后交给 LLM 生成回答。
     """
     model: str = ""
     messages: list[ChatMessage]
     temperature: float | None = 0.3
     stream: bool = False
     max_tokens: int | None = None
-    tools: list[dict] | None = None        # OpenAI 格式的工具定义列表
-    tool_choice: str | dict | None = None  # "auto" | "none" | "required" | {"type":"function","function":{"name":"x"}}
+    tools: list[dict] | None = None        # OpenAI 格式的工具定义列表（简单 RAG 忽略）
+    tool_choice: str | dict | None = None  # 简单 RAG 忽略
     filters: dict[str, str] | None = None  # metadata 过滤条件，如 {"source_format": "pdf"}
-    session_id: str | None = None          # 会话 ID，用于持久化多轮对话历史
 
 
 class ChatCompletionChoice(BaseModel):
+    """OpenAI 兼容的补全选项（一条 assistant 回复）。"""
     index: int = 0
     message: ChatMessage
     finish_reason: str = "stop"
 
 
 class ChatCompletionResponse(BaseModel):
+    """OpenAI 兼容的聊天补全响应。"""
     id: str
     object: str = "chat.completion"
     created: int
@@ -324,6 +321,7 @@ class ChatCompletionResponse(BaseModel):
 
 
 class ModelItem(BaseModel):
+    """OpenAI 兼容的模型项（/v1/models 返回的元素）。"""
     id: str
     object: str = "model"
     created: int
@@ -331,6 +329,7 @@ class ModelItem(BaseModel):
 
 
 class ModelListResponse(BaseModel):
+    """OpenAI 兼容的模型列表响应（/v1/models）。"""
     object: str = "list"
     data: list[ModelItem]
 
@@ -340,16 +339,19 @@ class ModelListResponse(BaseModel):
 
 @app.get("/")
 def root():
+    """API 基本信息。"""
     return {"message": "RAG API is running"}
 
 
 @app.get("/health")
 def health():
+    """健康检查，返回 {"status": "ok"}。"""
     return {"status": "ok"}
 
 
 @app.get("/index/info")
 def index_info():
+    """查看索引配置（嵌入模型、Qdrant 地址、支持的文件类型等）。"""
     return {
         "import_dir": str(settings.import_dir),
         "qdrant_host": settings.qdrant_host,
@@ -363,6 +365,7 @@ def index_info():
 
 @app.get("/index/preview")
 def index_preview(directory: str | None = None, recursive: bool = True):
+    """预览待索引的文件列表（不实际解析/写入）。"""
     dir_path = Path(directory) if directory else settings.import_dir
     if not dir_path.is_dir():
         raise HTTPException(status_code=404, detail=f"目录不存在: {dir_path}")
@@ -377,6 +380,7 @@ def index_preview(directory: str | None = None, recursive: bool = True):
 
 @app.post("/index/directory", response_model=IndexDirectoryResponse)
 def index_directory(body: IndexDirectoryRequest):
+    """同步索引指定目录（阻塞等待完成，适合少量文件）。"""
     dir_path = Path(body.directory) if body.directory else settings.import_dir
     if not dir_path.is_dir():
         raise HTTPException(status_code=404, detail=f"目录不存在: {dir_path}")
@@ -389,6 +393,7 @@ def index_directory(body: IndexDirectoryRequest):
 
 @app.post("/index/directory/async")
 def index_directory_async(body: IndexDirectoryRequest, background_tasks: BackgroundTasks):
+    """异步索引目录（后台执行，立即返回 task_id）。"""
     dir_path = Path(body.directory) if body.directory else settings.import_dir
     if not dir_path.is_dir():
         raise HTTPException(status_code=404, detail=f"目录不存在: {dir_path}")
@@ -416,10 +421,7 @@ def index_directory_async(body: IndexDirectoryRequest, background_tasks: Backgro
         "total_files": len(files),
     }
 def ask(body: AskRequest):
-    """兼容端点 —— 内部转 messages 走统一 Hybrid Agent。
-
-    保留此端点仅为兼容已有调用方，新接入建议用 /v1/chat/completions。
-    """
+    """RAG 问答 —— 检索 + LLM 生成。"""
     provider = body.llm_provider or settings.llm_provider
     model = body.llm_model or (
         settings.api_default_model if provider == "api"
@@ -428,14 +430,19 @@ def ask(body: AskRequest):
     api_base = body.llm_api_base or settings.api_default_base
     api_key = body.llm_api_key or resolve_api_key(model)
 
-    messages = [{"role": "user", "content": body.query}]
-    messages, tools = rag_skill.apply(messages, None)
-
-    result = _run_hybrid_agent(messages, tools, provider, model, api_base, api_key)
+    retriever = get_retriever()
+    result = retriever.ask(
+        body.query,
+        filters=body.filters,
+        llm_provider=provider,
+        llm_model=model,
+        llm_api_base=api_base,
+        llm_api_key=api_key,
+    )
     return AskResponse(
         query=body.query,
-        answer=(result.get("content") or "").strip(),
-        sources=[],
+        answer=result["answer"],
+        sources=result["sources"],
     )
 
 
@@ -542,35 +549,6 @@ def list_docs(collection: str | None = None):
         "total_chunks": sum(d["chunks"] for d in docs),
         "documents": docs,
     }
-
-
-# ── 对话历史管理 ──────────────────────────────────────────
-
-
-@app.get("/v1/conversations")
-def list_conversations_endpoint():
-    """列出所有持久化的会话（摘要）。"""
-    from app.conversation_store import list_conversations
-    return {"conversations": list_conversations()}
-
-
-@app.get("/v1/conversations/{session_id}")
-def get_conversation(session_id: str):
-    """获取指定会话的完整消息历史。"""
-    from app.conversation_store import load_conversation
-    msgs = load_conversation(session_id)
-    if msgs is None:
-        raise HTTPException(status_code=404, detail=f"会话不存在: {session_id}")
-    return {"session_id": session_id, "messages": msgs}
-
-
-@app.delete("/v1/conversations/{session_id}")
-def delete_conversation_endpoint(session_id: str):
-    """删除指定会话。"""
-    from app.conversation_store import delete_conversation
-    if not delete_conversation(session_id):
-        raise HTTPException(status_code=404, detail=f"会话不存在: {session_id}")
-    return {"message": "已删除", "session_id": session_id}
 
 
 # ── 文档删除 ──────────────────────────────────────────────
@@ -820,47 +798,17 @@ def list_models():
     return ModelListResponse(data=[ModelItem(**m) for m in _build_models_list()])
 
 
-# ── Agent 工具与循环 ──────────────────────────────────────
-
-MAX_HYBRID_ROUNDS = 6
-
-
-
-def _messages_to_dicts(msgs: list[ChatMessage]) -> list[dict]:
-    """将 Pydantic ChatMessage 列表转为 dict 列表（供 retriever 使用）。"""
-    result: list[dict] = []
-    for m in msgs:
-        d: dict = {"role": m.role}
-        if m.content is not None:
-            d["content"] = m.content
-        if m.tool_calls is not None:
-            d["tool_calls"] = m.tool_calls
-        if m.tool_call_id is not None:
-            d["tool_call_id"] = m.tool_call_id
-        if m.name is not None:
-            d["name"] = m.name
-        result.append(d)
-    return result
-
-
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 def chat_completions(body: ChatCompletionRequest):
-    """OpenAI 兼容的聊天补全端点。
+    """OpenAI 兼容端点 —— 简单 RAG 问答（检索 + LLM 生成，无 agent 循环）。
 
-    统一 Hybrid Agent：所有请求自动经过 RAG Skill 预处理（system prompt 增补
-    + tools 补齐）后进入 Agent 循环。LLM 自主决策调用 RAG 工具或外抛外部工具。
-
-    支持:
-    - session_id 多轮对话持久化（SQLite 跨重启保留）
-    - 流式输出（stream=true 时返回 SSE）
-    - tool_calls 双向透传（外部工具外抛给 Hermes）
+    供 openwebui 等 OpenAI 兼容客户端使用。提取用户最后一条消息作为查询，
+    检索知识库后交给 LLM 生成回答。
     """
     logger = logging.getLogger(__name__)
 
-    # 模型解析：优先请求指定，否则默认 Ollama
-    model = body.model or settings.ollama_default_model
-
-    # 判断 LLM 后端：在 Ollama 列表中 → ollama，否则 → api
+    # 模型解析
+    model = body.model or settings.api_default_model
     ollama_models = _discover_ollama_models()
     if model in ollama_models:
         provider = "ollama"
@@ -871,630 +819,38 @@ def chat_completions(body: ChatCompletionRequest):
         api_base = settings.api_default_base
         api_key = resolve_api_key(model)
 
-    messages_dicts = _messages_to_dicts(body.messages)
+    # 提取用户最后一条消息作为查询
+    user_msgs = [m.content for m in body.messages if m.role == "user" and m.content]
+    query = user_msgs[-1].strip() if user_msgs else ""
 
-    # ── 对话历史持久化：加载已有消息 ──────────────────────
-    if body.session_id:
-        from app.conversation_store import load_conversation
-        stored = load_conversation(body.session_id)
-        if stored:
-            messages_dicts = stored
-            logger.info("会话 %s: 加载 %d 条历史", body.session_id, len(messages_dicts))
-
-    # ── RAG Skill 预处理 ──────────────────────────────
-    messages_dicts, tools = rag_skill.apply(messages_dicts, body.tools)
-
-    if body.stream:
-        return StreamingResponse(
-            _stream_hybrid_agent(
-                messages_dicts, tools, provider, model,
-                api_base, api_key, model,
-            ),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+    if not query:
+        return ChatCompletionResponse(
+            id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            created=int(time.time()),
+            model=model,
+            choices=[ChatCompletionChoice(
+                message=ChatMessage(role="assistant", content=""),
+                finish_reason="stop",
+            )],
         )
 
-    result = _run_hybrid_agent(
-        messages_dicts, tools, provider, model,
-        api_base, api_key,
+    # 检索 + 生成
+    retriever = get_retriever()
+    result = retriever.ask(
+        query,
+        filters=body.filters,
+        llm_provider=provider,
+        llm_model=model,
+        llm_api_base=api_base,
+        llm_api_key=api_key,
     )
-
-    # ── 对话历史持久化：保存对话 ──────────────────────────
-    if body.session_id:
-        from app.conversation_store import append_and_save
-        last_user = next(
-            (m for m in reversed(body.messages) if m.role == "user"), None
-        )
-        new_msgs: list[dict] = []
-        if last_user:
-            new_msgs.append({"role": "user", "content": last_user.content or ""})
-        new_msgs.append({"role": "assistant", "content": result.get("content") or ""})
-        append_and_save(body.session_id, new_msgs, model=model)
-        logger.info("会话 %s: 已保存 %d 条消息", body.session_id, len(new_msgs))
 
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
         created=int(time.time()),
         model=model,
         choices=[ChatCompletionChoice(
-            message=ChatMessage(
-                role="assistant",
-                content=result.get("content"),
-                tool_calls=result.get("tool_calls"),
-            ),
-            finish_reason=result.get("finish_reason", "stop"),
+            message=ChatMessage(role="assistant", content=result["answer"]),
+            finish_reason="stop",
         )],
     )
-
-
-# ── 流式输出辅助 ────────────────────────────────────────────
-
-
-def _build_sse(
-    chat_id: str, created: int, request_model: str,
-    delta: dict | None = None,
-    finish_reason: str | None = None,
-) -> str:
-    """构建一条 OpenAI 兼容的 SSE data 行。
-
-    与旧版 _sse(content, finish_reason) 的区别：
-    - 接受任意 delta dict（可包含 content、tool_calls 等）
-    - 不假定 delta 只有 content 字段
-
-    参数:
-        delta: 完整的 delta 字典，如 {"content": "你好"} 或 {"tool_calls": [...]}
-        finish_reason: None（中间块）/"stop"/"error"/"tool_calls"
-    """
-    chunk = {
-        "id": chat_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": request_model,
-        "choices": [{
-            "index": 0,
-            "delta": delta or {},
-            "finish_reason": finish_reason,
-        }],
-    }
-    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-
-# ── Tool 透传 RAG 上下文注入 ───────────────────────────────
-
-
-def _expand_query(query: str) -> list[str]:
-    """为遍历式查询生成扩展检索角度（纯规则，零 LLM 调用）。
-
-    对于"检索所有X""汇总X"等需要高召回的问题，返回改写角度
-    用于多路补充检索。非遍历式 query 返回空列表。
-    """
-    expanded: list[str] = []
-    has_broad_kw = any(
-        kw in query for kw in
-        ["所有", "全部", "汇总", "总结", "检索所有", "列出所有", "都有哪些", "收集"]
-    )
-    if not has_broad_kw:
-        return expanded
-
-    # 提取核心主题词
-    core = query
-    for prefix in ["检索所有", "列出所有", "汇总", "总结", "列出"]:
-        core = core.replace(prefix, "").strip()
-    core = core.lstrip("的提及之关于中有关").strip()
-
-    if core:
-        expanded = [
-            f"{core} 列表",
-            f"关于 {core} 的详细信息",
-            f"{core} 统计",
-        ]
-    return expanded[:3]
-
-
-# 弯引号/全角引号 → ASCII 引号。国内 LLM（DeepSeek/Qwen 等）常输出中文弯引号
-# “ ”（U+201C/U+201D），而正则按 ASCII " 匹配，需先归一化。
-_QUOTE_TRANS = str.maketrans({
-    '“': '"', '”': '"',   # “ ”
-    '„': '"', '‟': '"',   # „ ‟
-    '＂': '"',                   # ＂ 全角引号
-    '‘': "'", '’': "'",   # ‘ ’
-    '‚': "'", '‛': "'",   # ‚ ‛
-    '＇': "'",                   # ＇ 全角单引号
-})
-
-
-def _normalize_quotes(text: str) -> str:
-    """把弯引号/全角引号归一化为 ASCII 引号，供 XML tool call 正则匹配。"""
-    return text.translate(_QUOTE_TRANS)
-
-
-def _parse_xml_tool_calls(content: str) -> tuple[str | None, list[dict] | None]:
-    """从 LLM 文本输出中提取 XML 格式的 tool_calls，返回 (clean_content, tool_calls)。
-
-    某些 LLM（如 deepseek）偶尔把 tool call 写成文本 XML 而非标准 tool_calls 字段。
-    兜底解析 <tool_calls> / <invoke> 格式，并返回去除 XML 后的干净内容。
-    未匹配时返回 (content, None)。
-
-    支持格式:
-        <tool_calls>
-        <invoke name="search_knowledge_base">
-        <parameter name="query">巴普</parameter>
-        </invoke>
-        </tool_calls>
-
-    也支持带类型标注的参数（Claude/Anthropic XML 风格）：
-        <parameter name="collection" string="true">workfile</parameter>
-
-    也支持裸 <invoke>（无外层 <tool_calls> 包裹）：
-        <invoke name="list_documents">
-        <parameter name="collection">workfile</parameter>
-        </invoke>
-    """
-    if not content:
-        return (content, None)
-
-    # 归一化引号（弯引号 → ASCII），否则正则匹配不到中文 LLM 输出的 XML 属性
-    content = _normalize_quotes(content)
-
-    # 先尝试 <tool_calls> 包裹格式
-    wrapper_match = re.search(r'<tool_calls>\s*(.*?)\s*</tool_calls>', content, re.DOTALL)
-    if wrapper_match:
-        inner = wrapper_match.group(1)
-    else:
-        # 降级：匹配裸 <invoke>（DeepSeek 偶尔省略外层 <tool_calls>）
-        # [^>]* 匹配 invoke 标签上可能存在的额外属性（如 string="true"）
-        if not re.search(r'<invoke\s+name="[^"]+"[^>]*>', content):
-            return (content, None)
-        inner = content
-
-    # 解析每个 <invoke> 块 —— [^>]* 兼容额外属性
-    invoke_re = r'<invoke\s+name="([^"]+)"[^>]*>\s*(.*?)\s*</invoke>'
-    # 参数正则：name 值后面可以有任意其他属性（如 string="true"），[^>]* 跳过它们
-    param_re = r'<parameter\s+name="([^"]+)"[^>]*>(.*?)</parameter>'
-
-    parsed: list[dict] = []
-    for im in re.finditer(invoke_re, inner, re.DOTALL):
-        func_name = im.group(1)
-        params_block = im.group(2)
-        args: dict = {}
-        for pm in re.finditer(param_re, params_block, re.DOTALL):
-            args[pm.group(1)] = pm.group(2).strip()
-
-        if not args:
-            # 没解析到参数也不放弃 —— 至少把 invoke name 记录下来
-            logger_warn = logging.getLogger(__name__)
-            logger_warn.warning(
-                "XML invoke %s 未提取到有效参数，原始块: %.200s", func_name, params_block
-            )
-
-        call_id = f"call_xml_{uuid.uuid4().hex[:8]}"
-        parsed.append({
-            "id": call_id,
-            "type": "function",
-            "function": {
-                "name": func_name,
-                "arguments": json.dumps(args, ensure_ascii=False),
-            },
-        })
-
-    if not parsed:
-        return (content, None)
-
-    # 去除 XML 块，返回干净内容
-    if wrapper_match:
-        clean = content[:wrapper_match.start()] + content[wrapper_match.end():]
-    else:
-        # 裸 invoke：逐个去除每个 <invoke>...</invoke> 块
-        clean = re.sub(invoke_re, '', content, flags=re.DOTALL)
-    clean = clean.strip()
-
-    logger = logging.getLogger(__name__)
-    logger.info("XML tool_calls 解析: %s → %d 个工具调用",
-                 [tc["function"]["name"] for tc in parsed], len(parsed))
-
-    return (clean or None, parsed)
-
-
-def _run_hybrid_agent(
-    messages: list[dict],
-    tools: list[dict],
-    provider: str,
-    model: str,
-    api_base: str | None,
-    api_key: str | None,
-) -> dict:
-    """Hybrid Agent 循环 —— RAG 工具内部执行，外部工具透传给调用方。
-
-    工具分为两类：
-      * RAG 工具（search_knowledge_base 等）→ 内部 execute，继续循环
-      * 外部工具（web_search、code 等）→ 不执行，直接返回 tool_calls 给调用方
-
-    这确保了 Hermes 的 web_search 等能力不受影响，
-    同时 LLM 能主动调用 knowledge_base 搜索全面获取信息。
-    """
-    logger = logging.getLogger(__name__)
-
-    # RAG Skill 已在上游完成预处理（system prompt 追加 + tools 补齐），
-    # 这里直接使用预处理后的 messages 和 tools。
-    # 不注入 RAG 上下文，让 Agent 自己搜。
-    chat_messages = list(messages)
-
-    retriever = get_retriever()
-
-    # 搜索结果去重追踪：连续 N 轮无新结果 → 强制停止搜索
-    _last_search_sig: str | None = None
-    _stale_search_rounds = 0
-
-    for round_num in range(1, MAX_HYBRID_ROUNDS + 1):
-        logger.info("Hybrid Agent 第 %d 轮: %d 条消息, %d 个工具",
-                     round_num, len(chat_messages), len(tools))
-
-        try:
-            result = retriever.chat_llm(
-                chat_messages, tools=tools,
-                llm_provider=provider, llm_model=model,
-                llm_api_base=api_base, llm_api_key=api_key,
-            )
-        except Exception as e:
-            logger.error("Hybrid Agent 第 %d 轮 LLM 失败: %s", round_num, e)
-            return {
-                "content": f"Agent 调用失败: {e}",
-                "tool_calls": None,
-                "finish_reason": "error",
-            }
-
-        tool_calls = result.get("tool_calls")
-        content = result.get("content")
-
-        # ── XML 兜底：标准 tool_calls 为空时尝试从文本中解析 ──
-        if not tool_calls and content:
-            content, tool_calls = _parse_xml_tool_calls(content)
-        # 有 tool_calls 时清理 content 中残留的 XML 文本
-        if tool_calls and content and ('<tool_calls>' in content or '<invoke' in content):
-            content = _normalize_quotes(content)
-            content = re.sub(r'<tool_calls>.*?</tool_calls>\s*', '', content, flags=re.DOTALL)
-            content = re.sub(r'<invoke\s+name="[^"]+"[^>]*>\s*.*?\s*</invoke>\s*', '', content, flags=re.DOTALL)
-            content = content.strip() or None
-
-        if tool_calls:
-            # 记录 assistant 的 tool_calls 消息
-            chat_messages.append({
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls,
-            })
-
-            # 检查有没有外部工具调用
-            has_external = any(
-                not is_rag_tool(tc.get("function", {}).get("name", ""))
-                for tc in tool_calls
-            )
-
-            if has_external:
-                # 有外部工具 → 返回 tool_calls 给 Hermes
-                logger.info(
-                    "Hybrid Agent: 检测到外部工具调用，返回给 Hermes: %s",
-                    [tc.get("function", {}).get("name") for tc in tool_calls],
-                )
-                return {
-                    "content": content,
-                    "tool_calls": tool_calls,
-                    "finish_reason": "tool_calls",
-                }
-
-            # 全是 RAG 工具 → 内部执行
-            round_search_sig: str | None = None
-            for tc in tool_calls:
-                func_name = tc.get("function", {}).get("name", "")
-                func_args_raw = tc.get("function", {}).get("arguments", "{}")
-                if isinstance(func_args_raw, dict):
-                    func_args = func_args_raw
-                else:
-                    try:
-                        func_args = json.loads(func_args_raw)
-                    except (json.JSONDecodeError, TypeError):
-                        func_args = {}
-
-                tool_result = execute_tool(func_name, func_args)
-                chat_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", ""),
-                    "content": tool_result,
-                })
-                logger.info("Hybrid Agent: 执行 RAG 工具 %s → %d chars",
-                             func_name, len(tool_result))
-
-                # 累积本轮搜索结果的「指纹」
-                if func_name == "search_knowledge_base":
-                    lines = tool_result.strip().split("\n")
-                    sig = str(len(lines)) + "|" + tool_result[:200]
-                    round_search_sig = (
-                        sig if round_search_sig is None
-                        else round_search_sig + "||" + sig
-                    )
-
-            # 检测搜索结果是否与前一轮相同
-            if round_search_sig is not None:
-                if round_search_sig == _last_search_sig:
-                    _stale_search_rounds += 1
-                else:
-                    _stale_search_rounds = 0
-                _last_search_sig = round_search_sig
-
-            if _stale_search_rounds >= 2:
-                logger.info(
-                    "Hybrid Agent: 连续 %d 轮搜索无新结果，强制终止",
-                    _stale_search_rounds,
-                )
-                chat_messages.append({
-                    "role": "user",
-                    "content": (
-                        "[系统提示] 已经连续搜索了多轮，每次返回的搜索结果完全相同，"
-                        "说明知识库中没有更多相关信息。请直接根据已有信息回答用户问题，"
-                        "诚实告知哪些信息找到了、哪些没有找到。不要再调用搜索工具。"
-                    ),
-                })
-                break
-
-            continue  # 回到 LLM
-
-        # 没有 tool_calls → 最终回答
-        return {"content": content or "", "tool_calls": None, "finish_reason": "stop"}
-
-    # 循环耗尽（达到最大轮数）或去重强制终止 —— 引导 LLM 询问用户继续或总结
-    logger.info("Hybrid Agent: 循环结束，询问用户继续或总结")
-    if not (
-        chat_messages
-        and str(chat_messages[-1].get("content", "")).startswith("[系统提示]")
-    ):
-        chat_messages.append({
-            "role": "user",
-            "content": (
-                "[系统提示] 已经检索了很多轮。请停止继续检索，"
-                "向用户简要说明目前已检索到的信息概况，然后询问用户："
-                "是希望继续深入检索更多内容，还是基于现有结果进行总结。"
-                "不要自动替用户做决定，等待用户选择。"
-            ),
-        })
-    try:
-        final = retriever.chat_llm(
-            chat_messages, tools=None,
-            llm_provider=provider, llm_model=model,
-            llm_api_base=api_base, llm_api_key=api_key,
-        )
-        return {
-            "content": final.get("content") or "",
-            "tool_calls": None,
-            "finish_reason": "stop",
-        }
-    except Exception as e:
-        logger.error("Hybrid Agent 生成总结失败: %s", e)
-        return {
-            "content": f"检索已完成，但生成总结时出错: {e}",
-            "tool_calls": None,
-            "finish_reason": "error",
-        }
-
-
-def _stream_hybrid_agent(
-    messages: list[dict],
-    tools: list[dict],
-    provider: str,
-    model: str,
-    api_base: str | None,
-    api_key: str | None,
-    request_model: str,
-):
-    """Hybrid Agent 流式版 —— RAG 工具内部执行，外部工具透传 SSE。
-
-    流程:
-    1. 注入 RAG 知识库上下文
-    2. 调用 LLM（带合并后的 tools）
-    3. 如果 RAG tool_calls → 内部执行，SSE 输出进度，继续循环
-    4. 如果外部 tool_calls → SSE 输出 tool_calls delta，结束
-    5. 如果 content → 流式输出最终回答
-    """
-    logger = logging.getLogger(__name__)
-    chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    created = int(time.time())
-    retriever = get_retriever()
-
-    # RAG Skill 已在上游完成预处理（system prompt 追加 + tools 补齐），
-    # 这里直接使用预处理后的 messages 和 tools。
-    chat_messages = list(messages)
-
-    if not chat_messages or chat_messages[-1].get("role") != "user":
-        yield _build_sse(chat_id, created, request_model, finish_reason="stop")
-        yield "data: [DONE]\n\n"
-        return
-
-    # 搜索结果去重追踪：连续 N 轮无新结果 → 强制停止搜索
-    _last_search_sig: str | None = None
-    _stale_search_rounds = 0
-
-    for round_num in range(1, MAX_HYBRID_ROUNDS + 1):
-        logger.info("Hybrid Agent 流式第 %d 轮", round_num)
-
-        try:
-            result = retriever.chat_llm(
-                chat_messages, tools=tools,
-                llm_provider=provider, llm_model=model,
-                llm_api_base=api_base, llm_api_key=api_key,
-            )
-        except Exception as e:
-            logger.error("Hybrid Agent 第 %d 轮 LLM 调用失败: %s", round_num, e)
-            yield _build_sse(
-                chat_id, created, request_model,
-                delta={"content": f"\n\n[Agent 调用失败: {e}]"},
-                finish_reason="error",
-            )
-            yield "data: [DONE]\n\n"
-            return
-
-        tool_calls = result.get("tool_calls")
-        content = result.get("content")
-
-        # ── XML 兜底：标准 tool_calls 为空时尝试从文本中解析 ──
-        if not tool_calls and content:
-            content, tool_calls = _parse_xml_tool_calls(content)
-        # 有 tool_calls 时清理 content 中残留的 XML 文本
-        if tool_calls and content and ('<tool_calls>' in content or '<invoke' in content):
-            content = _normalize_quotes(content)
-            content = re.sub(r'<tool_calls>.*?</tool_calls>\s*', '', content, flags=re.DOTALL)
-            content = re.sub(r'<invoke\s+name="[^"]+"[^>]*>\s*.*?\s*</invoke>\s*', '', content, flags=re.DOTALL)
-            content = content.strip() or None
-
-        if tool_calls:
-            # 显示工具名（仅日志，不发送给客户端——避免手机端展示内部调试信息）
-            tool_names = [
-                tc.get("function", {}).get("name", "?")
-                for tc in tool_calls
-            ]
-
-            chat_messages.append({
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls,
-            })
-
-            # 检查有没有外部工具调用
-            has_external = any(
-                not is_rag_tool(tc.get("function", {}).get("name", ""))
-                for tc in tool_calls
-            )
-
-            if has_external:
-                # 外部工具 → 流式输出 tool_calls delta 并结束
-                logger.info(
-                    "Hybrid Agent 流式: 外部工具 %s → 返回给 Hermes",
-                    tool_names,
-                )
-                # OpenAI 流式规范要求每个 tool_call 带 index，否则接收方无法解析
-                indexed_tool_calls = [
-                    {**tc, "index": i} for i, tc in enumerate(tool_calls)
-                ]
-                yield _build_sse(
-                    chat_id, created, request_model,
-                    delta={"tool_calls": indexed_tool_calls},
-                    finish_reason="tool_calls",
-                )
-                yield "data: [DONE]\n\n"
-                return
-
-            # RAG 工具 → 内部执行，输出结果
-            round_search_sig: str | None = None
-            for tc in tool_calls:
-                func_name = tc.get("function", {}).get("name", "")
-                func_args_raw = tc.get("function", {}).get("arguments", "{}")
-                if isinstance(func_args_raw, dict):
-                    func_args = func_args_raw
-                else:
-                    try:
-                        func_args = json.loads(func_args_raw)
-                    except (json.JSONDecodeError, TypeError):
-                        func_args = {}
-
-                tool_result = execute_tool(func_name, func_args)
-                chat_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", ""),
-                    "content": tool_result,
-                })
-                # 不将工具结果发送给客户端——内部执行过程不应泄漏到手机端
-
-                # 累积本轮搜索结果的「指纹」（文件名列表 + 行数）
-                if func_name == "search_knowledge_base":
-                    lines = tool_result.strip().split("\n")
-                    sig = str(len(lines)) + "|" + tool_result[:200]
-                    round_search_sig = (
-                        sig if round_search_sig is None
-                        else round_search_sig + "||" + sig
-                    )
-
-            # 检测搜索结果是否与前一轮相同（去重追踪）
-            if round_search_sig is not None:
-                if round_search_sig == _last_search_sig:
-                    _stale_search_rounds += 1
-                else:
-                    _stale_search_rounds = 0
-                _last_search_sig = round_search_sig
-
-            if _stale_search_rounds >= 2:
-                logger.info(
-                    "Hybrid Agent 流式: 连续 %d 轮搜索无新结果，强制终止搜索",
-                    _stale_search_rounds,
-                )
-                chat_messages.append({
-                    "role": "user",
-                    "content": (
-                        "[系统提示] 已经连续搜索了多轮，每次返回的搜索结果完全相同，"
-                        "说明知识库中没有更多相关信息。请直接根据已有信息回答用户问题，"
-                        "诚实告知哪些信息找到了、哪些没有找到。不要再调用搜索工具。"
-                    ),
-                })
-                # 跳出 for 循环，让 LLM 生成最终回答
-                break
-
-            continue  # 回到 LLM
-
-        # ── 最终回答：流式生成 ──────────────────────────
-        try:
-            for delta in retriever.stream_chat_llm(
-                chat_messages, tools=None,
-                llm_provider=provider, llm_model=model,
-                llm_api_base=api_base, llm_api_key=api_key,
-            ):
-                if delta:
-                    yield _build_sse(chat_id, created, request_model, delta=delta)
-        except Exception as e:
-            logger.error("Hybrid Agent 流式生成失败: %s", e)
-            yield _build_sse(
-                chat_id, created, request_model,
-                delta={"content": f"\n\n[生成中断: {e}]"},
-                finish_reason="error",
-            )
-            yield "data: [DONE]\n\n"
-        return
-
-    # ── 循环耗尽（达到最大轮数）或去重强制终止 ──────────
-    # 引导 LLM 询问用户：继续检索 还是 总结现有结果
-    logger.info("Hybrid Agent 流式: 循环结束，询问用户继续或总结")
-    if not (
-        chat_messages
-        and str(chat_messages[-1].get("content", "")).startswith("[系统提示]")
-    ):
-        chat_messages.append({
-            "role": "user",
-            "content": (
-                "[系统提示] 已经检索了很多轮。请停止继续检索，"
-                "向用户简要说明目前已检索到的信息概况，然后询问用户："
-                "是希望继续深入检索更多内容，还是基于现有结果进行总结。"
-                "不要自动替用户做决定，等待用户选择。"
-            ),
-        })
-    try:
-        for delta in retriever.stream_chat_llm(
-            chat_messages, tools=None,
-            llm_provider=provider, llm_model=model,
-            llm_api_base=api_base, llm_api_key=api_key,
-        ):
-            if delta:
-                yield _build_sse(chat_id, created, request_model, delta=delta)
-    except Exception as e:
-        logger.error("Hybrid Agent 流式生成失败: %s", e)
-        yield _build_sse(
-            chat_id, created, request_model,
-            delta={"content": f"\n\n[生成中断: {e}]"},
-            finish_reason="error",
-        )
-        yield "data: [DONE]\n\n"
-        return
-    yield _build_sse(chat_id, created, request_model, finish_reason="stop")
-    yield "data: [DONE]\n\n"
-
-
-# ── Tool 透传流式生成器（保留，供降级/兼容使用）───────────
