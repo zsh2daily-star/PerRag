@@ -1245,11 +1245,39 @@ def _run_hybrid_agent(
         # 没有 tool_calls → 最终回答
         return {"content": content or "", "tool_calls": None, "finish_reason": "stop"}
 
-    return {
-        "content": "已达到最大工具调用轮数，请简化问题。",
-        "tool_calls": None,
-        "finish_reason": "stop",
-    }
+    # 循环耗尽（达到最大轮数）或去重强制终止 —— 引导 LLM 询问用户继续或总结
+    logger.info("Hybrid Agent: 循环结束，询问用户继续或总结")
+    if not (
+        chat_messages
+        and str(chat_messages[-1].get("content", "")).startswith("[系统提示]")
+    ):
+        chat_messages.append({
+            "role": "user",
+            "content": (
+                "[系统提示] 已经检索了很多轮。请停止继续检索，"
+                "向用户简要说明目前已检索到的信息概况，然后询问用户："
+                "是希望继续深入检索更多内容，还是基于现有结果进行总结。"
+                "不要自动替用户做决定，等待用户选择。"
+            ),
+        })
+    try:
+        final = retriever.chat_llm(
+            chat_messages, tools=None,
+            llm_provider=provider, llm_model=model,
+            llm_api_base=api_base, llm_api_key=api_key,
+        )
+        return {
+            "content": final.get("content") or "",
+            "tool_calls": None,
+            "finish_reason": "stop",
+        }
+    except Exception as e:
+        logger.error("Hybrid Agent 生成总结失败: %s", e)
+        return {
+            "content": f"检索已完成，但生成总结时出错: {e}",
+            "tool_calls": None,
+            "finish_reason": "error",
+        }
 
 
 def _stream_hybrid_agent(
@@ -1432,6 +1460,39 @@ def _stream_hybrid_agent(
             yield "data: [DONE]\n\n"
         return
 
+    # ── 循环耗尽（达到最大轮数）或去重强制终止 ──────────
+    # 引导 LLM 询问用户：继续检索 还是 总结现有结果
+    logger.info("Hybrid Agent 流式: 循环结束，询问用户继续或总结")
+    if not (
+        chat_messages
+        and str(chat_messages[-1].get("content", "")).startswith("[系统提示]")
+    ):
+        chat_messages.append({
+            "role": "user",
+            "content": (
+                "[系统提示] 已经检索了很多轮。请停止继续检索，"
+                "向用户简要说明目前已检索到的信息概况，然后询问用户："
+                "是希望继续深入检索更多内容，还是基于现有结果进行总结。"
+                "不要自动替用户做决定，等待用户选择。"
+            ),
+        })
+    try:
+        for delta in retriever.stream_chat_llm(
+            chat_messages, tools=None,
+            llm_provider=provider, llm_model=model,
+            llm_api_base=api_base, llm_api_key=api_key,
+        ):
+            if delta:
+                yield _build_sse(chat_id, created, request_model, delta=delta)
+    except Exception as e:
+        logger.error("Hybrid Agent 流式生成失败: %s", e)
+        yield _build_sse(
+            chat_id, created, request_model,
+            delta={"content": f"\n\n[生成中断: {e}]"},
+            finish_reason="error",
+        )
+        yield "data: [DONE]\n\n"
+        return
     yield _build_sse(chat_id, created, request_model, finish_reason="stop")
     yield "data: [DONE]\n\n"
 

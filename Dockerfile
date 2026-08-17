@@ -23,6 +23,10 @@ RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 单独安装 MCP（独立层，避免改 requirements.txt 导致全部依赖缓存失效重装）
+# 固定 1.x：2.0.0 把 FastMCP 重构成 MCPServer，API 不兼容
+RUN pip install --no-cache-dir "mcp>=1.0,<2.0"
+
 # 复制应用代码
 COPY app/ ./app/
 
