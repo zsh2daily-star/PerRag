@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex
+from llama_index.core import Document, StorageContext, VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.vector_stores.qdrant import QdrantVectorStore

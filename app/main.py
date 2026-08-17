@@ -805,8 +805,6 @@ def chat_completions(body: ChatCompletionRequest):
     供 openwebui 等 OpenAI 兼容客户端使用。提取用户最后一条消息作为查询，
     检索知识库后交给 LLM 生成回答。
     """
-    logger = logging.getLogger(__name__)
-
     # 模型解析
     model = body.model or settings.api_default_model
     ollama_models = _discover_ollama_models()

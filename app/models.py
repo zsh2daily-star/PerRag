@@ -9,7 +9,6 @@ indexer.py 和 retriever.py 各自需要加载 BGE-M3 和 Reranker 模型，
 
 import logging
 import threading
-from pathlib import Path
 from typing import Any
 
 import torch

@@ -18,7 +18,6 @@ MinerU 是一个基于深度学习的 PDF 解析引擎，可以：
 
 import logging
 import os
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -83,7 +82,7 @@ def _stop_ollama() -> None:
     """暂停 Ollama 释放显存。"""
     try:
         # Ollama 的 keep_alive=0 会让模型在当前请求完成后立即卸载
-        resp = httpx.post(
+        httpx.post(
             f"{settings.ollama_base_url}/api/generate",
             json={"model": settings.ollama_default_model, "keep_alive": 0},
             timeout=10,
