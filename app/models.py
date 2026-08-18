@@ -8,6 +8,7 @@ indexer.py 和 retriever.py 各自需要加载 BGE-M3 和 Reranker 模型，
 """
 
 import logging
+import os
 import threading
 from typing import Any
 
@@ -29,7 +30,9 @@ _offloaded: set[str] = set()  # 已卸载到 CPU 的模型名
 
 # ── 设备检测 ──────────────────────────────────────────────
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# EMBED_DEVICE 环境变量可强制嵌入/重排模型跑 CPU（如 "cpu"），
+# 用于释放 GPU 显存给本地 LLM。默认自动检测（有 GPU 用 cuda，否则 cpu）。
+DEVICE = os.getenv("EMBED_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
 logger.info("模型运行设备: %s", DEVICE.upper())
 if DEVICE == "cuda":
