@@ -237,7 +237,7 @@ rag-project/
 |------|--------|------|
 | `PG_USER` / `PG_PASSWORD` / `PG_DB` | `rag` / `rag_secret` / `rag` | PostgreSQL 连接 |
 | `PG_POOL_SIZE` | `10` | 连接池大小 |
-| `JWT_SECRET` | — | **必填**，`openssl rand -url 48` 生成 |
+| `JWT_SECRET` | — | **必填**，`openssl rand -base64 48` 生成 |
 | `JWT_EXPIRE_HOURS` | `24` | Token 有效期 |
 | `RAG_API_KEY` | `` | 接口鉴权，留空不启用 |
 
