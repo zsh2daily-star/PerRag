@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 
 from app.config import settings
-from app.indexer import DocumentIndexer
+from app.core_Qdrant import DocumentIndexer
 
 # 配置日志格式：时间戳 + 级别 + 模块名 + 消息
 logging.basicConfig(

@@ -16,7 +16,7 @@ services:
     build: .
     container_name: rag-mcp
     restart: unless-stopped
-    command: python -m app.mcp_server
+    command: python -m app.mcp.server
     ports:
       - "${RAG_MCP_PORT:-8001}:8001"
     environment:
@@ -59,6 +59,20 @@ services:
       # 模型缓存
       - HF_HOME=/app/models
       - NVIDIA_VISIBLE_DEVICES=all
+      # Ollama 本地 LLM（运行在宿主机）
+      - OLLAMA_HOST=host.docker.internal
+      - OLLAMA_PORT=11434
+      # 远程 API LLM（deepseek，供 agent 键值对提取/问答用）
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - LLM_KEYS=${LLM_KEYS:-{}}
+      - API_DEFAULT_BASE=${API_DEFAULT_BASE:-https://api.deepseek.com}
+      - API_DEFAULT_MODEL=${API_DEFAULT_MODEL:-deepseek-chat}
+      # PostgreSQL 业务数据库
+      - PG_DSN=postgresql+asyncpg://${PG_USER:-rag}:${PG_PASSWORD:-rag_secret}@postgres:5432/${PG_DB:-rag}
+      - PG_POOL_SIZE=${PG_POOL_SIZE:-10}
+      # JWT 认证
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - JWT_EXPIRE_HOURS=${JWT_EXPIRE_HOURS:-24}
     volumes:
       - ./data/uploads:/app/data/uploads
       - ./data/mineru:/app/data/mineru
@@ -66,14 +80,126 @@ services:
       - ./app:/app/app
       - /mnt/公司文件/公司内部文件:/app/data/ragtemp:ro
       - /mnt/个人文件:/app/data/personal:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - rag-network
       - shared-rag
     depends_on:
       qdrant:
         condition: service_started
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://localhost:8001/mcp"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── 业务后端 FastAPI（企业/检查/材料/审计 + 文件上传）──────
+  # 与 rag-mcp 同镜像不同进程：本服务跑 app.main:app，供前端 Vite 代理调用
+  # （web/vite.config.ts 代理目标 http://localhost:8000）。
+  # 历史上靠 `docker compose run` 临时起 one-off，导致容器名混乱、
+  # 且误用 8001 的 MCP 健康检查而长期 unhealthy；现固定为正式服务。
+  rag-api:
+    build: .
+    image: rag-project-rag-mcp
+    container_name: rag-api
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "${RAG_API_PORT:-8000}:8000"
+    environment:
+      # Qdrant 向量数据库
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-rag_documents}
+      # 嵌入/重排模型（EMBED_DEVICE=cpu 释放 GPU 显存给本地 LLM）
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-BAAI/bge-m3}
+      - RERANKER_MODEL=${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      - EMBED_DEVICE=${EMBED_DEVICE:-cpu}
+      # 文档处理
+      - CHUNK_SIZE=${CHUNK_SIZE:-512}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-50}
+      - PDF_PARSER=${PDF_PARSER:-mineru}
+      - IMPORT_DIR=/app/data/uploads
+      - EXCLUDE_PATHS=${EXCLUDE_PATHS:-}
+      # MinerU PDF 解析
+      - MINERU_HOST=mineru
+      - MINERU_PORT=8000
+      - MINERU_BACKEND=pipeline
+      - MINERU_LANG=ch
+      - MINERU_TIMEOUT=${MINERU_TIMEOUT:-600}
+      - MINERU_VRAM_THRESHOLD=${MINERU_VRAM_THRESHOLD:-0.65}
+      - MINERU_RESTART_EVERY_N=${MINERU_RESTART_EVERY_N:-10}
+      - MINERU_PAGE_CHUNK_SIZE=${MINERU_PAGE_CHUNK_SIZE:-20}
+      - MINERU_MIN_CHUNK_SIZE=${MINERU_MIN_CHUNK_SIZE:-5}
+      - MINERU_CHUNK_RESTART_EVERY=${MINERU_CHUNK_RESTART_EVERY:-5}
+      # RRF 融合权重
+      - RRF_DENSE_WEIGHT=${RRF_DENSE_WEIGHT:-1.0}
+      - RRF_SPARSE_WEIGHT=${RRF_SPARSE_WEIGHT:-1.0}
+      - HYDE_ENABLED=${HYDE_ENABLED:-false}
+      # 检索参数
+      - RETRIEVAL_TOP_K=${RETRIEVAL_TOP_K:-30}
+      - RERANK_TOP_K=${RERANK_TOP_K:-5}
+      - RERANK_BATCH_SIZE=${RERANK_BATCH_SIZE:-16}
+      # 模型缓存
+      - HF_HOME=/app/models
+      - NVIDIA_VISIBLE_DEVICES=all
+      # Ollama 本地 LLM（运行在宿主机）
+      - OLLAMA_HOST=host.docker.internal
+      - OLLAMA_PORT=11434
+      # 远程 API LLM（deepseek，供 agent 键值对提取/问答用）
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - LLM_KEYS=${LLM_KEYS:-{}}
+      - API_DEFAULT_BASE=${API_DEFAULT_BASE:-https://api.deepseek.com}
+      - API_DEFAULT_MODEL=${API_DEFAULT_MODEL:-deepseek-chat}
+      # PostgreSQL 业务数据库
+      - PG_DSN=postgresql+asyncpg://${PG_USER:-rag}:${PG_PASSWORD:-rag_secret}@postgres:5432/${PG_DB:-rag}
+      - PG_POOL_SIZE=${PG_POOL_SIZE:-10}
+      # JWT 认证
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - JWT_EXPIRE_HOURS=${JWT_EXPIRE_HOURS:-24}
+      # Hermes Agent API（智能问答：rag-api 流式代理到 Hermes API Server）
+      - HERMES_API_BASE=${HERMES_API_BASE:-http://hermes-webui:8642}
+      - HERMES_API_KEY=${HERMES_API_KEY:-}
+      # 对话计费（人民币 / 百万 tokens）
+      - CHAT_PRICE_INPUT_PER_M=${CHAT_PRICE_INPUT_PER_M:-2}
+      - CHAT_PRICE_OUTPUT_PER_M=${CHAT_PRICE_OUTPUT_PER_M:-8}
+      # 对话配额默认（管理员未覆盖时，非管理员日限额）
+      - CHAT_DAILY_LIMIT_DEFAULT=${CHAT_DAILY_LIMIT_DEFAULT:-1.0}
+      # 文书导出目录（不挂 volume，容器重建会丢；要持久化需在 compose volumes 段添加）
+      - DOC_EXPORT_DIR=/app/data/exports/交办单
+      - DOC_EXPORT_DIR_REVIEW=/app/data/exports/复查意见书
+      # 跨库聚合检索条数
+      - AGGREGATE_TOP_K=${AGGREGATE_TOP_K:-30}
+    volumes:
+      - ./data/uploads:/app/data/uploads
+      - ./data/mineru:/app/data/mineru
+      - ./models:/app/models
+      - ./app:/app/app
+      - /mnt/公司文件/公司内部文件:/app/data/ragtemp:ro
+      - /mnt/个人文件:/app/data/personal:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - rag-network
+      - shared-rag
+    depends_on:
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -99,6 +225,28 @@ services:
     networks:
       - rag-network
 
+  # ── PostgreSQL 业务数据库 ────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_USER=${PG_USER:-rag}
+      - POSTGRES_PASSWORD=${PG_PASSWORD:-rag_secret}
+      - POSTGRES_DB=${PG_DB:-rag}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-rag} -d ${PG_DB:-rag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   # ── MinerU PDF 解析服务 ────────────────────────────────
   mineru:
     image: t300/mineru:0.8.1-paddle-gpu-20251229-01
@@ -121,33 +269,6 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HF_ENDPOINT=https://hf-mirror.com
-
-  # ── Open WebUI 聊天前端 ───────────────────────────────
-  openwebui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: openwebui
-    restart: unless-stopped
-    ports:
-      - "${OPENWEBUI_PORT:-3000}:8080"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ./data/openwebui:/app/backend/data
-    networks:
-      - rag-network
-      - shared-rag
-    environment:
-      # 连接宿主机上的 Ollama（通过 host.docker.internal）
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-me-in-production}
-      # HuggingFace 镜像（加速国内模型下载）
-      - HF_ENDPOINT=https://hf-mirror.com
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
 
 # ── 网络 ──────────────────────────────────────────────────
 networks:

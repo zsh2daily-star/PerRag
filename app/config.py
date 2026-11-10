@@ -122,6 +122,23 @@ class Settings:
     # ── 安全 ─────────────────────────────────────────────
     rag_api_key: str            # API 鉴权密钥，不设置则不启用鉴权
 
+    # ── PostgreSQL 业务数据库（阶段 C）────────────────────
+    pg_dsn: str                 # asyncpg 连接串，如 postgresql+asyncpg://user:pass@host:5432/db
+    pg_pool_size: int           # 连接池大小
+
+    # ── JWT 认证（阶段 D）────────────────────────────────
+    jwt_secret: str             # JWT 签名密钥
+    jwt_expire_hours: int       # JWT 过期时间（小时）
+
+    # ── Hermes Agent API（智能问答流式代理）──────────────
+    hermes_api_base: str        # Hermes API Server 地址（容器网内 http://hermes-webui:8642）
+    hermes_api_key: str         # Hermes API_SERVER_KEY（Bearer 令牌，只在后端使用）
+
+    # ── 智能问答计费单价（人民币 / 百万 tokens）──────────
+    chat_price_input_per_m: float   # 输入（prompt）单价，默认 2
+    chat_price_output_per_m: float  # 输出（completion）单价，默认 8
+    chat_daily_limit_default: float  # 非管理员每日费用上限（元），默认 1.0；管理员不受限
+
     # ── 计算属性 ─────────────────────────────────────────
     @property
     def exclude_path_list(self) -> list[str]:
@@ -186,6 +203,15 @@ class Settings:
             multimodal_enabled=os.getenv("MULTIMODAL_ENABLED", "false").lower() in ("1", "true", "yes"),
             multimodal_image_dir=Path(os.getenv("MULTIMODAL_IMAGE_DIR", project_root / "data" / "images")),
             rag_api_key=os.getenv("RAG_API_KEY", ""),
+            pg_dsn=os.getenv("PG_DSN", "postgresql+asyncpg://rag:rag_secret@localhost:5432/rag"),
+            pg_pool_size=int(os.getenv("PG_POOL_SIZE", "10")),
+            jwt_secret=os.getenv("JWT_SECRET", "change-me-in-production"),
+            jwt_expire_hours=int(os.getenv("JWT_EXPIRE_HOURS", "24")),
+            hermes_api_base=os.getenv("HERMES_API_BASE", "http://hermes-webui:8642").rstrip("/"),
+            hermes_api_key=os.getenv("HERMES_API_KEY", ""),
+            chat_price_input_per_m=float(os.getenv("CHAT_PRICE_INPUT_PER_M", "2")),
+            chat_price_output_per_m=float(os.getenv("CHAT_PRICE_OUTPUT_PER_M", "8")),
+            chat_daily_limit_default=float(os.getenv("CHAT_DAILY_LIMIT_DEFAULT", "1.0")),
         )
 
 
